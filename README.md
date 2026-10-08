@@ -5,13 +5,16 @@ A port of [this](https://github.com/perfect-dark-pc-port/perfect_dark) to the PS
 
 ## Install
 
-NOTE: you also need the two Piglet modules. 
+NOTE: You need the two Piglet modules. 
 - `libScePigletv2VSH.sprx`
 - `libSceShaccVSH.sprx`
-if you have Super Mario 64 installed then you already have them.
+
+If you have Super Mario 64 installed then you already have them.
 
 1.) install the FPKG via Hen
+
 2.) place your rom file to data/perfectdark/pd.ntsc-final.z64
+
 3.) enjoy
 
 Data and Logs are also stored in that folder aswell.
@@ -118,3 +121,4 @@ source ~/.bashrc
 * NicNamSam for the icon;
 * everyone who has submitted pull requests and issues to this repository and tested the port;
 * probably more I'm forgetting.
+* [OpenOrbis](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain) 
