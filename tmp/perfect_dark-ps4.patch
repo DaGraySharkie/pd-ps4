@@ -1,0 +1,4826 @@
+diff --git a/.gitignore b/.gitignore
+index bb7c0cf..3bd964b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -26,3 +26,27 @@ tools/mkrom/mkrom
+ CppProperties.json
+ .idea
+ cmake-build-debug
++
++# PS4 port: local files that must never be committed (toolchain, libraries, your own images and
++# files, packages). ROMs are already covered by pd.*.z64 above; these catch the rest.
++/ps4/tools/
++/ps4/prefix/
++/ps4/deps/
++/ps4/custom/
++/ps4/pkg/
++/ps4/out/
++/ps4/pd.oelf
++/ps4/tests/shadertest/out/
++/ps4/tests/shadertest/inc/
++/ps4/tests/shadertest/harness
++/ps4/tests/shadertest/glstubs.cpp
++*.z64
++*.n64
++*.v64
++*.gbc
++*.sprx
++*.prx
++*.pkg
++*.elf
++pd.log
++ps4_boot.log
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f5bb7eb..dd5f228 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -67,6 +67,9 @@ elseif(APPLE)
+ elseif(NINTENDO_SWITCH)
+   # Switch
+   set(TARGET_OS "nswitch")
++elseif(PS4)
++  # PS4 homebrew, OpenOrbis toolchain (see the perfectdark-ps4 build scripts)
++  set(TARGET_OS "ps4")
+ elseif(UNIX)
+   # Generic *nix; assume Linux
+   set(TARGET_OS "linux")
+@@ -198,7 +201,9 @@ add_compile_options($<$<COMPILE_LANGUAGE:C>:-Wno-pointer-sign>)
+ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-function>)
+ 
+ # Platform-specific flags
+-if (APPLE)
++if (PS4)
++  # clang does not know this GCC warning
++elseif (APPLE)
+   # Make it look for libs in the executable folder manually since CMake's rpath system is wack
+   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rpath @executable_path")
+ else()
+@@ -211,7 +216,13 @@ endif()
+ set(LIBS )
+ 
+ # SDL2
++if(PS4)
++  # static SDL2 cross-built by build-deps.sh (dummy video driver, virtual joystick)
++  set(SDL2_INCLUDE_DIR "${PS4_PREFIX}/include/SDL2")
++  set(SDL2_LIBRARY "${PS4_PREFIX}/lib/libSDL2.a")
++else()
+ find_package(SDL2 REQUIRED)
++endif()
+ if(NINTENDO_SWITCH)
+   if(NOT SDL2_LIBRARY OR NOT SDL2_INCLUDE_DIR)
+     # sometimes FindSDL2 just wants us to suffer and does not set these
+@@ -230,7 +241,12 @@ endif()
+ list(APPEND LIBS "${ZLIB_LIBRARY}")
+ 
+ # GL
+-if(NOT GL_LIBRARY)
++if(PS4)
++  # Piglet (GLES2 + EGL) comes in through the SCE stub libraries of the toolchain file;
++  # the C/C++ runtime as well
++  set(GL_LIBRARY "")
++  set(EXTRA_LIBRARIES "")
++elseif(NOT GL_LIBRARY)
+   if(WIN32)
+     set(GL_LIBRARY opengl32)
+   elseif(NINTENDO_SWITCH)
+@@ -241,10 +257,14 @@ if(NOT GL_LIBRARY)
+     set(GL_LIBRARY GL)
+   endif()
+ endif()
+-list(APPEND LIBS "${GL_LIBRARY}")
++if(GL_LIBRARY)
++  list(APPEND LIBS "${GL_LIBRARY}")
++endif()
+ 
+ # Platform-specific extra libs
+-if(NOT EXTRA_LIBRARIES)
++if(PS4)
++  # nothing
++elseif(NOT EXTRA_LIBRARIES)
+   if(WIN32)
+     set(EXTRA_LIBRARIES dbghelp -static-libstdc++)
+   elseif(NINTENDO_SWITCH)
+@@ -253,13 +273,24 @@ if(NOT EXTRA_LIBRARIES)
+     set(EXTRA_LIBRARIES stdc++ m dl)
+   endif()
+ endif()
+-list(APPEND LIBS "${EXTRA_LIBRARIES}")
++if(EXTRA_LIBRARIES)
++  list(APPEND LIBS "${EXTRA_LIBRARIES}")
++endif()
+ 
+ # Sources
+ 
+ file(GLOB_RECURSE SRC_PORT "${CMAKE_SOURCE_DIR}/port/*.c")
+ file(GLOB_RECURSE SRC_PORT_CXX "${CMAKE_SOURCE_DIR}/port/*.cpp")
+ 
++# window/renderer backends: SDL2 + desktop GL/GLES3 everywhere, Piglet + GLES2 on PS4
++if(PS4)
++  list(FILTER SRC_PORT EXCLUDE REGEX "port/fast3d/glad/")
++  list(FILTER SRC_PORT_CXX EXCLUDE REGEX "port/fast3d/gfx_(opengl|sdl2)\\.cpp$")
++else()
++  list(FILTER SRC_PORT EXCLUDE REGEX "port/src/ps4/")
++  list(FILTER SRC_PORT_CXX EXCLUDE REGEX "port/fast3d/gfx_(gles2|ps4)\\.cpp$")
++endif()
++
+ file(GLOB_RECURSE SRC_GAME "${CMAKE_SOURCE_DIR}/src/game/*.c")
+ 
+ file(GLOB SRC_LIB_MP3 "${CMAKE_SOURCE_DIR}/src/lib/mp3/*.c")
+diff --git a/README.md b/README.md
+index 84edda7..c777b36 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,8 @@
++> **PS4 port.** This fork adds an experimental native PS4 version (OpenOrbis toolchain, Piglet
++> OpenGL ES 2.0, GoldHEN). Everything PS4-specific is in [`ps4/`](ps4/README.md): build, install and
++> controller instructions are there. No game data and no Sony files are included; you need your own
++> ROM. Based on the [Perfect Dark PC port](https://github.com/perfect-dark-pc-port/perfect_dark).
++
+ # Perfect Dark port
+ 
+ This repository contains a work-in-progress port of the [Perfect Dark decompilation](https://github.com/n64decomp/perfect_dark) to modern platforms.
+diff --git a/cmake/AssetUtils.cmake b/cmake/AssetUtils.cmake
+index 0a518b0..91e740e 100644
+--- a/cmake/AssetUtils.cmake
++++ b/cmake/AssetUtils.cmake
+@@ -1,3 +1,13 @@
++# The generators are Python scripts started through their shebang line, which only works where
++# commands run through a POSIX shell. Run them through the interpreter explicitly so Ninja on
++# Windows (commands go through cmd.exe) works too.
++find_package(Python3 COMPONENTS Interpreter QUIET)
++if(Python3_Interpreter_FOUND)
++  set(PD_ASSET_PYTHON "${Python3_EXECUTABLE}")
++else()
++  set(PD_ASSET_PYTHON "")
++endif()
++
+ # execute a header generator (execcmd) for every json file in jsonpath, collect headers in headerlist
+ # note that this reads ROMID
+ macro(generate_asset_headers jsonpath execcmd extraarg headerlist)
+@@ -18,7 +28,7 @@ macro(generate_asset_headers jsonpath execcmd extraarg headerlist)
+     add_custom_command(
+       OUTPUT  ${HEADERNAME}
+       DEPENDS ${JSON}
+-      COMMAND ${execcmd} ${JSON} ${extraarg} --headers-only --romid=${ROMID}
++      COMMAND ${PD_ASSET_PYTHON} ${execcmd} ${JSON} ${extraarg} --headers-only --romid=${ROMID}
+     )
+     list(APPEND ${headerlist} "${HEADERNAME}")
+   endforeach()
+diff --git a/port/fast3d/gfx_gles2.cpp b/port/fast3d/gfx_gles2.cpp
+new file mode 100644
+index 0000000..0bd7bc8
+--- /dev/null
++++ b/port/fast3d/gfx_gles2.cpp
+@@ -0,0 +1,1379 @@
++// OpenGL ES 2.0 rendering backend, derived from gfx_opengl.cpp for Piglet (PS4), which only
++// provides GLES 2.0 / GLSL ES 1.00. Differences from the desktop backend:
++//  - shaders are GLSL ES 1.00; textureSize() is replaced by uTexSize0/1 uniforms, no bitwise
++//    integer ops, no int-selector mix(), no "f" float suffixes
++//  - no VAOs, no MSAA, unsized texture formats, 16- or 24-bit depth renderbuffers
++//  - no glBlitFramebuffer: copies and the final present are textured quad draws
++#include "platform.h"
++
++#ifdef PLATFORM_PS4
++
++#include <stdint.h>
++#include <string.h>
++#include <algorithm>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include <map>
++#include <unordered_map>
++#include <vector>
++
++
++#ifndef _LANGUAGE_C
++#define _LANGUAGE_C
++#endif
++#include <PR/gbi.h>
++
++#include <orbis/Pigletv2VSH.h> // GLES2 + EGL headers with Piglet prototypes
++#include "system.h"
++
++#include "gfx_cc.h"
++#include "gfx_rendering_api.h"
++#include "gfx_pc.h"
++
++using namespace std;
++
++struct ShaderProgram {
++    GLuint opengl_program_id;
++    uint8_t num_inputs;
++    bool used_textures[SHADER_MAX_TEXTURES];
++    uint8_t num_floats;
++    GLint attrib_locations[16];
++    uint8_t attrib_sizes[16];
++    uint8_t num_attribs;
++    GLint frame_count_location;
++    GLint noise_scale_location;
++    GLint three_point_filter_locations[2];
++    GLint tex_size_locations[2];
++    float tex_size_set[2][2];
++};
++
++struct Framebuffer {
++    uint32_t width, height;
++    bool has_depth_buffer;
++    uint32_t msaa_level;
++    bool invert_y;
++
++    GLuint fbo, clrbuf, rbo;
++};
++
++static std::map<pair<uint64_t, uint32_t>, struct ShaderProgram> shader_program_pool;
++static GLuint opengl_vbo;
++static GLuint opengl_vao;
++static bool current_depth_mask;
++
++static uint32_t frame_count;
++
++static std::vector<Framebuffer> framebuffers;
++static size_t current_framebuffer;
++static float current_noise_scale;
++static int current_anisotropy_level;
++static FilteringMode current_filter_mode = FILTER_LINEAR;
++static MipmapFilteringMode current_mipmap_filter_mode = MIPMAP_LINEAR;
++static bool current_textures_linear_filter[2] = {false, false};
++
++static GLenum gl_mirror_clamp = GL_MIRRORED_REPEAT;
++static bool gl_npot_full = false;
++static bool gl_has_aniso = false;
++static bool gl_has_depth24 = false;
++static bool gl_highp_fs = false;
++static GLenum gl_depth_format = GL_DEPTH_COMPONENT16;
++
++// state the blit helper has to put back
++static struct ShaderProgram* current_prg;
++static GLuint bound_tex[2];
++static int active_tile = -1;
++static int cur_viewport[4];
++static int cur_scissor[4];
++static std::unordered_map<GLuint, std::pair<uint32_t, uint32_t>> tex_sizes;
++
++static int gfx_opengl_get_max_texture_size() {
++    GLint max_texture_size;
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
++    return max_texture_size;
++}
++
++static const char* gfx_opengl_get_name() {
++    return "OpenGL";
++}
++
++static struct GfxClipParameters gfx_opengl_get_clip_parameters(void) {
++    return { false, framebuffers[current_framebuffer].invert_y };
++}
++
++static void gfx_opengl_vertex_array_set_attribs(struct ShaderProgram* prg) {
++    size_t num_floats = prg->num_floats;
++    size_t pos = 0;
++
++    for (int i = 0; i < prg->num_attribs; i++) {
++        if (prg->attrib_locations[i] >= 0) {
++            glEnableVertexAttribArray(prg->attrib_locations[i]);
++            glVertexAttribPointer(prg->attrib_locations[i], prg->attrib_sizes[i], GL_FLOAT, GL_FALSE,
++                                num_floats * sizeof(float), (void*)(pos * sizeof(float)));
++        }
++        pos += prg->attrib_sizes[i];
++    }
++}
++
++static void gfx_opengl_set_uniforms(struct ShaderProgram* prg) {
++    if (prg->frame_count_location >= 0) {
++        glUniform1i(prg->frame_count_location, frame_count);
++    }
++    if (prg->noise_scale_location >= 0) {
++        glUniform1f(prg->noise_scale_location, current_noise_scale);
++    }
++    if (prg->three_point_filter_locations[0] >= 0) {
++        glUniform1i(prg->three_point_filter_locations[0], current_textures_linear_filter[0]);
++    }
++    if (prg->three_point_filter_locations[1] >= 0) {
++        glUniform1i(prg->three_point_filter_locations[1], current_textures_linear_filter[1]);
++    }
++}
++
++static void gfx_opengl_unload_shader(struct ShaderProgram* old_prg) {
++    if (old_prg != NULL) {
++        for (int i = 0; i < old_prg->num_attribs; i++) {
++            if (old_prg->attrib_locations[i] >= 0) {
++                glDisableVertexAttribArray(old_prg->attrib_locations[i]);
++            }
++        }
++    }
++}
++
++static void gfx_opengl_load_shader(struct ShaderProgram* new_prg) {
++    // if (!new_prg) return;
++    glUseProgram(new_prg->opengl_program_id);
++    current_prg = new_prg;
++    gfx_opengl_vertex_array_set_attribs(new_prg);
++    gfx_opengl_set_uniforms(new_prg);
++}
++
++static void append_str(char* buf, size_t* len, const char* str) {
++    while (*str != '\0') {
++        buf[(*len)++] = *str++;
++    }
++}
++
++static void append_line(char* buf, size_t* len, const char* str) {
++    while (*str != '\0') {
++        buf[(*len)++] = *str++;
++    }
++    buf[(*len)++] = '\n';
++}
++
++#define RAND_NOISE "((random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + 1.0) / 2.0)"
++
++static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
++                                      bool hint_single_element) {
++    if (!only_alpha) {
++        switch (item) {
++            case SHADER_0:
++                return with_alpha ? "vec4(0.0, 0.0, 0.0, 0.0)" : "vec3(0.0, 0.0, 0.0)";
++            case SHADER_1:
++                return with_alpha ? "vec4(1.0, 1.0, 1.0, 1.0)" : "vec3(1.0, 1.0, 1.0)";
++            case SHADER_INPUT_1:
++                return with_alpha || !inputs_have_alpha ? "vInput1" : "vInput1.rgb";
++            case SHADER_INPUT_2:
++                return with_alpha || !inputs_have_alpha ? "vInput2" : "vInput2.rgb";
++            case SHADER_INPUT_3:
++                return with_alpha || !inputs_have_alpha ? "vInput3" : "vInput3.rgb";
++            case SHADER_INPUT_4:
++                return with_alpha || !inputs_have_alpha ? "vInput4" : "vInput4.rgb";
++            case SHADER_TEXEL0:
++                return with_alpha ? "texVal0" : "texVal0.rgb";
++            case SHADER_TEXEL0A:
++                return hint_single_element ? "texVal0.a"
++                                           : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
++                                                         : "vec3(texVal0.a, texVal0.a, texVal0.a)");
++            case SHADER_TEXEL1A:
++                return hint_single_element ? "texVal1.a"
++                                           : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
++                                                         : "vec3(texVal1.a, texVal1.a, texVal1.a)");
++            case SHADER_TEXEL1:
++                return with_alpha ? "texVal1" : "texVal1.rgb";
++            case SHADER_COMBINED:
++                return with_alpha ? "texel" : "texel.rgb";
++            case SHADER_NOISE:
++                return with_alpha ? "vec4(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")"
++                                  : "vec3(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")";
++        }
++    } else {
++        switch (item) {
++            case SHADER_0:
++                return "0.0";
++            case SHADER_1:
++                return "1.0";
++            case SHADER_INPUT_1:
++                return "vInput1.a";
++            case SHADER_INPUT_2:
++                return "vInput2.a";
++            case SHADER_INPUT_3:
++                return "vInput3.a";
++            case SHADER_INPUT_4:
++                return "vInput4.a";
++            case SHADER_TEXEL0:
++                return "texVal0.a";
++            case SHADER_TEXEL0A:
++                return "texVal0.a";
++            case SHADER_TEXEL1A:
++                return "texVal1.a";
++            case SHADER_TEXEL1:
++                return "texVal1.a";
++            case SHADER_COMBINED:
++                return "texel.a";
++            case SHADER_NOISE:
++                return RAND_NOISE;
++        }
++    }
++    return "";
++}
++
++#undef RAND_NOISE
++
++static void append_formula(char* buf, size_t* len, uint8_t c[2][4], bool do_single, bool do_multiply, bool do_mix,
++                           bool with_alpha, bool only_alpha, bool opt_alpha) {
++    if (do_single) {
++        append_str(buf, len, shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, false));
++    } else if (do_multiply) {
++        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, false));
++        append_str(buf, len, " * ");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, true));
++    } else if (do_mix) {
++        append_str(buf, len, "mix(");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, false));
++        append_str(buf, len, ", ");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, false));
++        append_str(buf, len, ", ");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, true));
++        append_str(buf, len, ")");
++    } else {
++        append_str(buf, len, "(");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, false));
++        append_str(buf, len, " - ");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, false));
++        append_str(buf, len, ") * ");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, true));
++        append_str(buf, len, " + ");
++        append_str(buf, len, shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, false));
++    }
++}
++
++static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shader_id0, uint32_t shader_id1) {
++    struct CCFeatures cc_features = { 0 };
++    gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
++
++    char vs_buf[2048];
++    char fs_buf[8192];
++    size_t vs_len = 0;
++    size_t fs_len = 0;
++    size_t num_floats = 4;
++
++    // Vertex shader
++
++    append_line(vs_buf, &vs_len, "#version 100");
++
++    append_line(vs_buf, &vs_len, "precision highp float;");
++
++    if (false) { // GLSL ES 1.00
++        append_line(vs_buf, &vs_len, "#define INPUT in");
++        append_line(vs_buf, &vs_len, "#define OUTPUT out");
++    } else {
++        append_line(vs_buf, &vs_len, "#define INPUT attribute");
++        append_line(vs_buf, &vs_len, "#define OUTPUT varying");
++    }
++
++    append_line(vs_buf, &vs_len, "INPUT vec4 aVtxPos;");
++
++    for (int i = 0; i < 2; i++) {
++        if (cc_features.used_textures[i]) {
++            vs_len += sprintf(vs_buf + vs_len, "INPUT vec2 aTexCoord%d;\n", i);
++            vs_len += sprintf(vs_buf + vs_len, "OUTPUT vec2 vTexCoord%d;\n", i);
++            num_floats += 2;
++            for (int j = 0; j < 2; j++) {
++                if (cc_features.clamp[i][j]) {
++                    vs_len += sprintf(vs_buf + vs_len, "INPUT float aTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
++                    vs_len += sprintf(vs_buf + vs_len, "OUTPUT float vTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
++                    num_floats += 1;
++                }
++            }
++        }
++    }
++    if (cc_features.opt_fog) {
++        append_line(vs_buf, &vs_len, "INPUT vec4 aFog;");
++        append_line(vs_buf, &vs_len, "OUTPUT vec4 vFog;");
++        num_floats += 4;
++    }
++
++    if (cc_features.opt_grayscale) {
++        append_line(vs_buf, &vs_len, "INPUT vec4 aGrayscaleColor;");
++        append_line(vs_buf, &vs_len, "OUTPUT vec4 vGrayscaleColor;");
++        num_floats += 4;
++    }
++
++    for (int i = 0; i < cc_features.num_inputs; i++) {
++        vs_len += sprintf(vs_buf + vs_len, "INPUT vec%d aInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
++        vs_len += sprintf(vs_buf + vs_len, "OUTPUT vec%d vInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
++        num_floats += cc_features.opt_alpha ? 4 : 3;
++    }
++
++    append_line(vs_buf, &vs_len, "void main() {");
++    for (int i = 0; i < 2; i++) {
++        if (cc_features.used_textures[i]) {
++            vs_len += sprintf(vs_buf + vs_len, "    vTexCoord%d = aTexCoord%d;\n", i, i);
++            for (int j = 0; j < 2; j++) {
++                if (cc_features.clamp[i][j]) {
++                    vs_len += sprintf(vs_buf + vs_len, "    vTexClamp%s%d = aTexClamp%s%d;\n", j == 0 ? "S" : "T", i,
++                                      j == 0 ? "S" : "T", i);
++                }
++            }
++        }
++    }
++    if (cc_features.opt_fog) {
++        append_line(vs_buf, &vs_len, "    vFog = aFog;");
++    }
++    if (cc_features.opt_grayscale) {
++        append_line(vs_buf, &vs_len, "    vGrayscaleColor = aGrayscaleColor;");
++    }
++    for (int i = 0; i < cc_features.num_inputs; i++) {
++        vs_len += sprintf(vs_buf + vs_len, "    vInput%d = aInput%d;\n", i + 1, i + 1);
++    }
++
++    append_line(vs_buf, &vs_len, "    gl_Position = aVtxPos;");
++    // HACK: workaround for no GL_DEPTH_CLAMP (never available in GLES2)
++    append_line(vs_buf, &vs_len, "    gl_Position.z *= 0.3;");
++    append_line(vs_buf, &vs_len, "}");
++
++    // Fragment shader
++
++    append_line(fs_buf, &fs_len, "#version 100");
++
++    append_line(fs_buf, &fs_len, gl_highp_fs ? "precision highp float;" : "precision mediump float;");
++
++    if (false) { // GLSL ES 1.00
++        append_line(fs_buf, &fs_len, "#define INPUT in");
++        append_line(fs_buf, &fs_len, "#define OUTPUT_COLOR outColor");
++        append_line(fs_buf, &fs_len, "#define SAMPLE_TEX(tex, uv) texture(tex, uv)");
++    } else {
++        append_line(fs_buf, &fs_len, "#define INPUT varying");
++        append_line(fs_buf, &fs_len, "#define OUTPUT_COLOR gl_FragColor");
++        append_line(fs_buf, &fs_len, "#define SAMPLE_TEX(tex, uv) texture2D(tex, uv)");
++    }
++
++    // Reference approach to color wrapping as per GLideN64
++    // Return wrapped value of x in interval [low, high)
++    append_line(fs_buf, &fs_len, "#define WRAP(x, low, high) mod((x)-(low), (high)-(low)) + (low)");
++
++    append_line(fs_buf, &fs_len, "#define TEX_OFFSET(tex, uv, texSize, off) SAMPLE_TEX(tex, uv - (off)/texSize)");
++
++    // append_line(fs_buf, &fs_len, "precision mediump float;");
++    for (int i = 0; i < 2; i++) {
++        if (cc_features.used_textures[i]) {
++            fs_len += sprintf(fs_buf + fs_len, "INPUT vec2 vTexCoord%d;\n", i);
++            for (int j = 0; j < 2; j++) {
++                if (cc_features.clamp[i][j]) {
++                    fs_len += sprintf(fs_buf + fs_len, "INPUT float vTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
++                }
++            }
++        }
++    }
++    if (cc_features.opt_fog) {
++        append_line(fs_buf, &fs_len, "INPUT vec4 vFog;");
++    }
++    if (cc_features.opt_grayscale) {
++        append_line(fs_buf, &fs_len, "INPUT vec4 vGrayscaleColor;");
++    }
++    for (int i = 0; i < cc_features.num_inputs; i++) {
++        fs_len += sprintf(fs_buf + fs_len, "INPUT vec%d vInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
++    }
++
++    if (cc_features.used_textures[0]) {
++        append_line(fs_buf, &fs_len, "uniform sampler2D uTex0;");
++        append_line(fs_buf, &fs_len, "uniform vec2 uTexSize0;");
++        if (current_filter_mode == FILTER_THREE_POINT)
++            append_line(fs_buf, &fs_len, "uniform int three_point_filter0;");
++    }
++    if (cc_features.used_textures[1]) {
++        append_line(fs_buf, &fs_len, "uniform sampler2D uTex1;");
++        append_line(fs_buf, &fs_len, "uniform vec2 uTexSize1;");
++        if (current_filter_mode == FILTER_THREE_POINT)
++            append_line(fs_buf, &fs_len, "uniform int three_point_filter1;");
++    }
++
++    append_line(fs_buf, &fs_len, "uniform int frame_count;");
++    append_line(fs_buf, &fs_len, "uniform float noise_scale;");
++
++    append_line(fs_buf, &fs_len, "float random(in vec3 value) {");
++    append_line(fs_buf, &fs_len, "    float random = dot(sin(value), vec3(12.9898, 78.233, 37.719));");
++    append_line(fs_buf, &fs_len, "    return fract(sin(random) * 143758.5453);");
++    append_line(fs_buf, &fs_len, "}");
++
++    if (current_filter_mode == FILTER_THREE_POINT) {
++        append_line(fs_buf, &fs_len, "vec4 filter3point(in sampler2D tex, in vec2 texCoord, in vec2 texSize) {");
++        append_line(fs_buf, &fs_len, "    vec2 offset = fract(texCoord*texSize - vec2(0.5));");
++        append_line(fs_buf, &fs_len, "    offset -= step(1.0, offset.x + offset.y);");
++        append_line(fs_buf, &fs_len, "    vec4 c0 = TEX_OFFSET(tex, texCoord, texSize, offset);");
++        append_line(fs_buf, &fs_len, "    vec4 c1 = TEX_OFFSET(tex, texCoord, texSize, vec2(offset.x - sign(offset.x), offset.y));");
++        append_line(fs_buf, &fs_len, "    vec4 c2 = TEX_OFFSET(tex, texCoord, texSize, vec2(offset.x, offset.y - sign(offset.y)));");
++        append_line(fs_buf, &fs_len, "    return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);");
++        append_line(fs_buf, &fs_len, "}");
++    }
++
++    if (cc_features.opt_blur) {
++        // blur filter, used for menu backgrounds
++        // used to be two for loops from 0 to 4, but apparently intel drivers crashed trying to unroll it
++        // used to have a const weight array, but apparently drivers for the GT620 don't like const array initializers
++
++        if (current_filter_mode == FILTER_THREE_POINT)
++            append_line(fs_buf, &fs_len, "lowp vec4 hookTexture2D(in sampler2D t, in vec2 uv, in vec2 texSize, in int three_point_filter) {");
++        else
++            append_line(fs_buf, &fs_len, "lowp vec4 hookTexture2D(in sampler2D t, in vec2 uv, in vec2 texSize) {");
++
++        append_line(fs_buf, &fs_len, "    lowp vec4 cw = vec4(0.0);");
++        append_line(fs_buf, &fs_len, "    for (int i = 0; i < 16; ++i) {");
++        append_line(fs_buf, &fs_len, "        vec2 xy = vec2(mod(float(i), 4.0), floor(float(i) / 4.0));");
++        append_line(fs_buf, &fs_len, "        lowp float w = 0.009947 - length(xy) * 0.001;");
++        append_line(fs_buf, &fs_len, "        vec2 scaled_uv = uv + (vec2(-1.5) + xy) / texSize;");
++
++        if (current_filter_mode == FILTER_THREE_POINT)
++            append_line(fs_buf, &fs_len, "        lowp vec4 tex = mix(SAMPLE_TEX(t, scaled_uv), filter3point(t, scaled_uv, texSize), float(three_point_filter));");
++        else
++            append_line(fs_buf, &fs_len, "        lowp vec4 tex = SAMPLE_TEX(t, scaled_uv);");
++
++        append_line(fs_buf, &fs_len, "        cw += vec4(tex.rgb * w, w);");
++        append_line(fs_buf, &fs_len, "    }");
++        append_line(fs_buf, &fs_len, "    return vec4(cw.rgb / cw.a, 1.0);");
++        append_line(fs_buf, &fs_len, "}");
++    } else {
++        if (current_filter_mode == FILTER_THREE_POINT) {
++            append_line(fs_buf, &fs_len, "vec4 hookTexture2D(in sampler2D tex, in vec2 uv, in vec2 texSize, in int three_point_filter) {");
++            append_line(fs_buf, &fs_len, "    return mix(SAMPLE_TEX(tex, uv), filter3point(tex, uv, texSize), float(three_point_filter));");
++            append_line(fs_buf, &fs_len, "}");
++        } else {
++            append_line(fs_buf, &fs_len, "vec4 hookTexture2D(in sampler2D tex, in vec2 uv, in vec2 texSize) {");
++            append_line(fs_buf, &fs_len, "    return SAMPLE_TEX(tex, uv);");
++            append_line(fs_buf, &fs_len, "}");
++        }
++    }
++
++    if (false) { // GLSL ES 1.00
++        append_line(fs_buf, &fs_len, "out vec4 outColor;");
++    }
++
++    append_line(fs_buf, &fs_len, "void main() {");
++
++    for (int i = 0; i < 2; i++) {
++        if (cc_features.used_textures[i]) {
++            bool s = cc_features.clamp[i][0], t = cc_features.clamp[i][1];
++
++            fs_len += sprintf(fs_buf + fs_len, "    vec2 texSize%d = uTexSize%d;\n", i, i);
++
++            if (!s && !t) {
++                fs_len += sprintf(fs_buf + fs_len, "    vec2 vTexCoordAdj%d = vTexCoord%d;\n", i, i);
++            } else {
++                if (s && t) {
++                    fs_len += sprintf(fs_buf + fs_len,
++                                      "    vec2 vTexCoordAdj%d = clamp(vTexCoord%d, 0.5 / texSize%d, "
++                                      "vec2(vTexClampS%d, vTexClampT%d));\n",
++                                      i, i, i, i, i);
++                } else if (s) {
++                    fs_len += sprintf(fs_buf + fs_len,
++                                      "    vec2 vTexCoordAdj%d = vec2(clamp(vTexCoord%d.s, 0.5 / "
++                                      "texSize%d.s, vTexClampS%d), vTexCoord%d.t);\n",
++                                      i, i, i, i, i);
++                } else {
++                    fs_len += sprintf(fs_buf + fs_len,
++                                      "    vec2 vTexCoordAdj%d = vec2(vTexCoord%d.s, clamp(vTexCoord%d.t, "
++                                      "0.5 / texSize%d.t, vTexClampT%d));\n",
++                                      i, i, i, i, i);
++                }
++            }
++
++            if (current_filter_mode == FILTER_THREE_POINT)
++                fs_len += sprintf(fs_buf + fs_len, "    vec4 texVal%d = hookTexture2D(uTex%d, vTexCoordAdj%d, texSize%d, three_point_filter%d);\n", i, i, i, i, i);
++            else
++                fs_len += sprintf(fs_buf + fs_len, "    vec4 texVal%d = hookTexture2D(uTex%d, vTexCoordAdj%d, texSize%d);\n", i, i, i, i);
++        }
++    }
++
++    append_line(fs_buf, &fs_len, cc_features.opt_alpha ? "    vec4 texel;" : "    vec3 texel;");
++    for (int c = 0; c < (cc_features.opt_2cyc ? 2 : 1); c++) {
++        append_str(fs_buf, &fs_len, "    texel = ");
++        if (!cc_features.color_alpha_same[c] && cc_features.opt_alpha) {
++            append_str(fs_buf, &fs_len, "vec4(");
++            append_formula(fs_buf, &fs_len, cc_features.c[c], cc_features.do_single[c][0],
++                           cc_features.do_multiply[c][0], cc_features.do_mix[c][0], false, false, true);
++            append_str(fs_buf, &fs_len, ", ");
++            append_formula(fs_buf, &fs_len, cc_features.c[c], cc_features.do_single[c][1],
++                           cc_features.do_multiply[c][1], cc_features.do_mix[c][1], true, true, true);
++            append_str(fs_buf, &fs_len, ")");
++        } else {
++            append_formula(fs_buf, &fs_len, cc_features.c[c], cc_features.do_single[c][0],
++                           cc_features.do_multiply[c][0], cc_features.do_mix[c][0], cc_features.opt_alpha, false,
++                           cc_features.opt_alpha);
++        }
++        append_line(fs_buf, &fs_len, ";");
++
++        if (c == 0) {
++            append_line(fs_buf, &fs_len, "    texel = WRAP(texel, -1.01, 1.01);");
++        }
++    }
++
++    append_line(fs_buf, &fs_len, "    texel = WRAP(texel, -0.51, 1.51);");
++    append_line(fs_buf, &fs_len, "    texel = clamp(texel, 0.0, 1.0);");
++    // TODO discard if alpha is 0?
++    if (cc_features.opt_fog) {
++        if (cc_features.opt_alpha) {
++            append_line(fs_buf, &fs_len, "    texel = vec4(mix(texel.rgb, vFog.rgb, vFog.a), texel.a);");
++        } else {
++            append_line(fs_buf, &fs_len, "    texel = mix(texel, vFog.rgb, vFog.a);");
++        }
++    }
++
++    if (cc_features.opt_texture_edge && cc_features.opt_alpha) {
++        append_line(fs_buf, &fs_len, "    if (texel.a > 0.19) texel.a = 1.0; else discard;");
++    }
++
++    if (cc_features.opt_alpha && cc_features.opt_noise) {
++        append_line(fs_buf, &fs_len,
++                    "    texel.a *= floor(clamp(random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + "
++                    "texel.a, 0.0, 1.0));");
++    }
++
++    if (cc_features.opt_grayscale) {
++        append_line(fs_buf, &fs_len, "    float intensity = (texel.r + texel.g + texel.b) / 3.0;");
++        append_line(fs_buf, &fs_len, "    vec3 new_texel = vGrayscaleColor.rgb * intensity;");
++        append_line(fs_buf, &fs_len, "    texel.rgb = mix(texel.rgb, new_texel, vGrayscaleColor.a);");
++    }
++
++    if (cc_features.opt_alpha) {
++        if (cc_features.opt_alpha_threshold) {
++            append_line(fs_buf, &fs_len, "    if (texel.a < 8.0 / 256.0) discard;");
++        }
++        if (cc_features.opt_invisible) {
++            append_line(fs_buf, &fs_len, "    texel.a = 0.0;");
++        }
++
++        append_line(fs_buf, &fs_len, "    OUTPUT_COLOR = texel;");
++    } else {
++        append_line(fs_buf, &fs_len, "    OUTPUT_COLOR = vec4(texel, 1.0);");
++    }
++
++    append_line(fs_buf, &fs_len, "}");
++
++    vs_buf[vs_len] = '\0';
++    fs_buf[fs_len] = '\0';
++
++    const GLchar* sources[2] = { vs_buf, fs_buf };
++    const GLint lengths[2] = { (GLint)vs_len, (GLint)fs_len };
++    GLint success;
++
++    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
++    glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
++    glCompileShader(vertex_shader);
++    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
++    if (!success) {
++        GLint max_length = 1024;
++        glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
++        char error_log[1024];
++        glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
++        sysLogPrintf(LOG_ERROR, "Failed to compile this vertex shader (ID %llx, %x):\n%s", shader_id0, shader_id1, vs_buf);
++        sysFatalError("Vertex shader compilation failed:\n%s", error_log);
++    }
++
++    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
++    glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
++    glCompileShader(fragment_shader);
++    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
++    if (!success) {
++        GLint max_length = 1024;
++        glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
++        char error_log[1024];
++        glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
++        sysLogPrintf(LOG_ERROR, "Failed to compile this fragment shader (ID %llx, %x):\n%s", shader_id0, shader_id1, fs_buf);
++        sysFatalError("Fragment shader compilation failed:\n%s", error_log);
++    }
++
++    GLuint shader_program = glCreateProgram();
++    glAttachShader(shader_program, vertex_shader);
++    glAttachShader(shader_program, fragment_shader);
++    glLinkProgram(shader_program);
++
++    glDetachShader(shader_program, vertex_shader);
++    glDetachShader(shader_program, fragment_shader);
++    glDeleteShader(vertex_shader);
++    glDeleteShader(fragment_shader);
++
++    size_t cnt = 0;
++
++    struct ShaderProgram* prg = &shader_program_pool[make_pair(shader_id0, shader_id1)];
++    prg->attrib_locations[cnt] = glGetAttribLocation(shader_program, "aVtxPos");
++    prg->attrib_sizes[cnt] = 4;
++    ++cnt;
++
++    for (int i = 0; i < 2; i++) {
++        if (cc_features.used_textures[i]) {
++            char name[32];
++            sprintf(name, "aTexCoord%d", i);
++            prg->attrib_locations[cnt] = glGetAttribLocation(shader_program, name);
++            prg->attrib_sizes[cnt] = 2;
++            ++cnt;
++
++            for (int j = 0; j < 2; j++) {
++                if (cc_features.clamp[i][j]) {
++                    sprintf(name, "aTexClamp%s%d", j == 0 ? "S" : "T", i);
++                    prg->attrib_locations[cnt] = glGetAttribLocation(shader_program, name);
++                    prg->attrib_sizes[cnt] = 1;
++                    ++cnt;
++                }
++            }
++        }
++    }
++
++    if (cc_features.opt_fog) {
++        prg->attrib_locations[cnt] = glGetAttribLocation(shader_program, "aFog");
++        prg->attrib_sizes[cnt] = 4;
++        ++cnt;
++    }
++
++    if (cc_features.opt_grayscale) {
++        prg->attrib_locations[cnt] = glGetAttribLocation(shader_program, "aGrayscaleColor");
++        prg->attrib_sizes[cnt] = 4;
++        ++cnt;
++    }
++
++    for (int i = 0; i < cc_features.num_inputs; i++) {
++        char name[16];
++        sprintf(name, "aInput%d", i + 1);
++        prg->attrib_locations[cnt] = glGetAttribLocation(shader_program, name);
++        prg->attrib_sizes[cnt] = cc_features.opt_alpha ? 4 : 3;
++        ++cnt;
++    }
++
++    prg->opengl_program_id = shader_program;
++    prg->num_inputs = cc_features.num_inputs;
++    prg->used_textures[0] = cc_features.used_textures[0];
++    prg->used_textures[1] = cc_features.used_textures[1];
++    prg->num_floats = num_floats;
++    prg->num_attribs = cnt;
++
++    glUseProgram(shader_program);
++
++    if (cc_features.used_textures[0]) {
++        GLint sampler_location = glGetUniformLocation(shader_program, "uTex0");
++        glUniform1i(sampler_location, 0);
++    }
++    if (cc_features.used_textures[1]) {
++        GLint sampler_location = glGetUniformLocation(shader_program, "uTex1");
++        glUniform1i(sampler_location, 1);
++    }
++
++    prg->frame_count_location = glGetUniformLocation(shader_program, "frame_count");
++    prg->noise_scale_location = glGetUniformLocation(shader_program, "noise_scale");
++    prg->three_point_filter_locations[0] = glGetUniformLocation(shader_program, "three_point_filter0");
++    prg->three_point_filter_locations[1] = glGetUniformLocation(shader_program, "three_point_filter1");
++    prg->tex_size_locations[0] = glGetUniformLocation(shader_program, "uTexSize0");
++    prg->tex_size_locations[1] = glGetUniformLocation(shader_program, "uTexSize1");
++    prg->tex_size_set[0][0] = prg->tex_size_set[0][1] = -1.f;
++    prg->tex_size_set[1][0] = prg->tex_size_set[1][1] = -1.f;
++
++    {
++        GLint linked = 0;
++        glGetProgramiv(shader_program, GL_LINK_STATUS, &linked);
++        if (!linked) {
++            char log[1024] = { 0 };
++            GLsizei len = 0;
++            glGetProgramInfoLog(shader_program, sizeof(log) - 1, &len, log);
++            sysLogPrintf(LOG_ERROR, "GLES2: link failed (ID %llx, %x):\n%s\n%s", shader_id0, shader_id1, vs_buf, fs_buf);
++            sysFatalError("Shader program link failed:\n%s", log);
++        }
++    }
++
++    gfx_opengl_load_shader(prg);
++
++    return prg;
++}
++
++static struct ShaderProgram* gfx_opengl_lookup_shader(uint64_t shader_id0, uint32_t shader_id1) {
++    auto it = shader_program_pool.find(make_pair(shader_id0, shader_id1));
++    return it == shader_program_pool.end() ? nullptr : &it->second;
++}
++
++static void gfx_opengl_shader_get_info(struct ShaderProgram* prg, uint8_t* num_inputs, bool used_textures[2]) {
++    *num_inputs = prg->num_inputs;
++    used_textures[0] = prg->used_textures[0];
++    used_textures[1] = prg->used_textures[1];
++}
++
++static void gfx_opengl_clear_shaders(void) {
++    glUseProgram(0);
++    current_prg = nullptr;
++    for (auto& pair : shader_program_pool) {
++        glDeleteProgram(pair.second.opengl_program_id);
++    }
++    shader_program_pool.clear();
++}
++
++
++// ---------------------------------------------------------------------------------------------
++// Textures
++// ---------------------------------------------------------------------------------------------
++
++static bool is_pot(uint32_t v) {
++    return v && !(v & (v - 1));
++}
++
++static GLuint gfx_opengl_new_texture(void) {
++    GLuint ret;
++    glGenTextures(1, &ret);
++    return ret;
++}
++
++static void gfx_opengl_delete_texture(uint32_t texID) {
++    tex_sizes.erase(texID);
++    glDeleteTextures(1, &texID);
++}
++
++static void gles2_set_active_tile(int tile) {
++    if (active_tile != tile) {
++        glActiveTexture(GL_TEXTURE0 + tile);
++        active_tile = tile;
++    }
++}
++
++static void gfx_opengl_select_texture(int tile, GLuint texture_id, bool linear_filter) {
++    gles2_set_active_tile(tile);
++    glBindTexture(GL_TEXTURE_2D, texture_id);
++    bound_tex[tile] = texture_id;
++    current_textures_linear_filter[tile] = linear_filter;
++}
++
++static void gfx_opengl_upload_texture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height, bool gen_mipmaps) {
++    // GLES2: unsized internal format, must match the external format
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
++    tex_sizes[bound_tex[active_tile]] = { width, height };
++    const bool can_mip = gl_npot_full || (is_pot(width) && is_pot(height));
++    if (can_mip && (gen_mipmaps || current_filter_mode == FILTER_THREE_POINT)) {
++        glGenerateMipmap(GL_TEXTURE_2D);
++    }
++}
++
++static uint32_t gfx_cm_to_opengl(uint32_t val) {
++    switch (val) {
++        case G_TX_NOMIRROR | G_TX_CLAMP:
++            return GL_CLAMP_TO_EDGE;
++        case G_TX_MIRROR | G_TX_WRAP:
++            return GL_MIRRORED_REPEAT;
++        case G_TX_MIRROR | G_TX_CLAMP:
++            return gl_mirror_clamp;
++        case G_TX_NOMIRROR | G_TX_WRAP:
++            return GL_REPEAT;
++    }
++    return GL_REPEAT;
++}
++
++static void gfx_opengl_set_sampler_parameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt, bool mipmaps) {
++    const GLint min_filters[3][3] = {
++        // MIPMAP_DISABLED   MIPMAP_NEAREST               MIPMAP_LINEAR
++        {  GL_NEAREST,       GL_NEAREST_MIPMAP_NEAREST,   GL_NEAREST_MIPMAP_LINEAR  }, // FILTER_NONE
++        {  GL_LINEAR,        GL_LINEAR_MIPMAP_NEAREST,    GL_LINEAR_MIPMAP_LINEAR   }, // FILTER_BILINEAR
++        {  GL_NEAREST,       GL_NEAREST,                  GL_NEAREST                }, // FILTER_THREE_POINT
++    };
++
++    // Without GL_OES_texture_npot, a non-power-of-two texture (framebuffer copies) is incomplete
++    // with REPEAT wrapping or mipmapped filtering, and samples as black.
++    bool npot_limited = false;
++    if (!gl_npot_full) {
++        auto it = tex_sizes.find(bound_tex[tile]);
++        if (it != tex_sizes.end()) {
++            npot_limited = !is_pot(it->second.first) || !is_pot(it->second.second);
++        }
++    }
++
++    mipmaps = mipmaps && !npot_limited && (current_mipmap_filter_mode != MIPMAP_DISABLED);
++    const int mip_idx = mipmaps ? current_mipmap_filter_mode : 0;
++    const GLint min_filter = linear_filter ? min_filters[current_filter_mode][mip_idx] : GL_NEAREST;
++    const GLint max_filter = linear_filter && (current_filter_mode == FILTER_LINEAR) ? GL_LINEAR : GL_NEAREST;
++
++    gles2_set_active_tile(tile);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, max_filter);
++
++    if (mipmaps && gl_has_aniso) {
++        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, (GLfloat)(current_anisotropy_level > 0 ? current_anisotropy_level : 1));
++    }
++
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, npot_limited ? GL_CLAMP_TO_EDGE : gfx_cm_to_opengl(cms));
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, npot_limited ? GL_CLAMP_TO_EDGE : gfx_cm_to_opengl(cmt));
++}
++
++static void gfx_opengl_set_depth_mode(bool depth_test, bool depth_update, bool depth_compare, bool depth_source_prim, uint16_t zmode) {
++    if (depth_test) {
++        glEnable(GL_DEPTH_TEST);
++        glDepthMask(depth_update ? GL_TRUE : GL_FALSE);
++        current_depth_mask = depth_update;
++
++        if (depth_compare) {
++            switch (zmode) {
++                case ZMODE_INTER:
++                    glDepthFunc(GL_LEQUAL);
++                    glDisable(GL_POLYGON_OFFSET_FILL);
++                    glPolygonOffset(0, 0);
++                    break;
++
++                case ZMODE_OPA:
++                case ZMODE_XLU:
++                    if (depth_source_prim) {
++                        glDepthFunc(GL_LEQUAL);
++                    } else {
++                        glDepthFunc(GL_LESS);
++                    }
++                    glDisable(GL_POLYGON_OFFSET_FILL);
++                    glPolygonOffset(0, 0);
++                    break;
++
++                case ZMODE_DEC:
++                    glDepthFunc(GL_LEQUAL);
++                    glEnable(GL_POLYGON_OFFSET_FILL);
++                    glPolygonOffset(-2, -2);
++                    break;
++            }
++        } else {
++            glDepthFunc(GL_ALWAYS);
++            glDisable(GL_POLYGON_OFFSET_FILL);
++            glPolygonOffset(0, 0);
++        }
++    } else {
++        glDisable(GL_DEPTH_TEST);
++    }
++}
++
++
++static void gfx_opengl_set_depth_range(float znear, float zfar) {
++    glDepthRangef(znear, zfar);
++}
++
++static void gfx_opengl_set_viewport(int x, int y, int width, int height) {
++    cur_viewport[0] = x; cur_viewport[1] = y; cur_viewport[2] = width; cur_viewport[3] = height;
++    glViewport(x, y, width, height);
++}
++
++static void gfx_opengl_set_scissor(int x, int y, int width, int height) {
++    cur_scissor[0] = x; cur_scissor[1] = y; cur_scissor[2] = width; cur_scissor[3] = height;
++    glScissor(x, y, width, height);
++}
++
++static void gfx_opengl_set_use_alpha(bool use_alpha, bool modulate) {
++    if (use_alpha) {
++        glEnable(GL_BLEND);
++    } else {
++        glDisable(GL_BLEND);
++    }
++    if (modulate) {
++        glBlendFunc(GL_DST_COLOR, GL_ZERO);
++    } else {
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++    }
++}
++
++static void gles2_set_tex_size_uniforms(struct ShaderProgram* prg) {
++    for (int i = 0; i < 2; i++) {
++        if (prg->tex_size_locations[i] < 0) {
++            continue;
++        }
++        float w = 1.0f, h = 1.0f;
++        auto it = tex_sizes.find(bound_tex[i]);
++        if (it != tex_sizes.end()) {
++            w = (float)it->second.first;
++            h = (float)it->second.second;
++        }
++        if (prg->tex_size_set[i][0] != w || prg->tex_size_set[i][1] != h) {
++            glUniform2f(prg->tex_size_locations[i], w, h);
++            prg->tex_size_set[i][0] = w;
++            prg->tex_size_set[i][1] = h;
++        }
++    }
++}
++
++static void gfx_opengl_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
++    if (current_prg) {
++        // replaces textureSize(), which GLSL ES 1.00 does not have
++        gles2_set_tex_size_uniforms(current_prg);
++    }
++    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
++    glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
++}
++
++// ---------------------------------------------------------------------------------------------
++// Blitting (GLES2 has no glBlitFramebuffer): draw a textured quad with a dedicated program and
++// put back every bit of state the fast3d layer caches.
++// ---------------------------------------------------------------------------------------------
++
++static GLuint blit_program;
++static GLint blit_tex_location;
++
++static GLuint gles2_compile(GLenum type, const char* src) {
++    GLuint sh = glCreateShader(type);
++    glShaderSource(sh, 1, &src, NULL);
++    glCompileShader(sh);
++    GLint ok = 0;
++    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[1024] = { 0 };
++        GLsizei len = 0;
++        glGetShaderInfoLog(sh, sizeof(log) - 1, &len, log);
++        sysFatalError("GLES2: blit shader compilation failed:\n%s", log);
++    }
++    return sh;
++}
++
++static void gles2_init_blit(void) {
++    static const char* vs =
++        "attribute vec2 aPos;\n"
++        "attribute vec2 aUV;\n"
++        "varying vec2 vUV;\n"
++        "void main() {\n"
++        "    vUV = aUV;\n"
++        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
++        "}\n";
++    static const char* fs =
++        "precision mediump float;\n"
++        "uniform sampler2D uTex;\n"
++        "varying vec2 vUV;\n"
++        "void main() {\n"
++        "    gl_FragColor = texture2D(uTex, vUV);\n"
++        "}\n";
++    GLuint v = gles2_compile(GL_VERTEX_SHADER, vs);
++    GLuint f = gles2_compile(GL_FRAGMENT_SHADER, fs);
++    blit_program = glCreateProgram();
++    glAttachShader(blit_program, v);
++    glAttachShader(blit_program, f);
++    glBindAttribLocation(blit_program, 0, "aPos");
++    glBindAttribLocation(blit_program, 1, "aUV");
++    glLinkProgram(blit_program);
++    GLint ok = 0;
++    glGetProgramiv(blit_program, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        sysFatalError("GLES2: blit program link failed");
++    }
++    glDetachShader(blit_program, v);
++    glDetachShader(blit_program, f);
++    glDeleteShader(v);
++    glDeleteShader(f);
++    blit_tex_location = glGetUniformLocation(blit_program, "uTex");
++}
++
++// src rect is in texels of src_tex (GL convention, origin bottom left), dst rect in pixels of the
++// destination framebuffer. dst_y0 > dst_y1 flips the image vertically.
++static void gles2_blit(GLuint src_tex, uint32_t src_w, uint32_t src_h, int sx0, int sy0, int sx1, int sy1,
++                       GLuint dst_fbo, uint32_t dst_w, uint32_t dst_h, int dx0, int dy0, int dx1, int dy1,
++                       bool linear) {
++    const GLboolean blend_on = glIsEnabled(GL_BLEND);
++    const GLboolean depth_on = glIsEnabled(GL_DEPTH_TEST);
++    const GLboolean scissor_on = glIsEnabled(GL_SCISSOR_TEST);
++
++    if (current_prg) {
++        gfx_opengl_unload_shader(current_prg);
++    }
++
++    glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
++    glViewport(0, 0, dst_w, dst_h);
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_DEPTH_TEST);
++    glDisable(GL_BLEND);
++    glDepthMask(GL_FALSE);
++
++    const float fw = (float)dst_w, fh = (float)dst_h;
++    const float x0 = dx0 / fw * 2.f - 1.f, x1 = dx1 / fw * 2.f - 1.f;
++    const float y0 = dy0 / fh * 2.f - 1.f, y1 = dy1 / fh * 2.f - 1.f;
++    const float u0 = (float)sx0 / src_w, u1 = (float)sx1 / src_w;
++    const float v0 = (float)sy0 / src_h, v1 = (float)sy1 / src_h;
++    const float quad[16] = {
++        x0, y0, u0, v0,
++        x1, y0, u1, v0,
++        x0, y1, u0, v1,
++        x1, y1, u1, v1,
++    };
++
++    glUseProgram(blit_program);
++    glUniform1i(blit_tex_location, 0);
++    gles2_set_active_tile(0);
++    glBindTexture(GL_TEXTURE_2D, src_tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
++    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STREAM_DRAW);
++    glEnableVertexAttribArray(0);
++    glEnableVertexAttribArray(1);
++    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
++    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++    glDisableVertexAttribArray(0);
++    glDisableVertexAttribArray(1);
++
++    // restore
++    glBindTexture(GL_TEXTURE_2D, bound_tex[0]);
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[current_framebuffer].fbo);
++    glViewport(cur_viewport[0], cur_viewport[1], cur_viewport[2], cur_viewport[3]);
++    glScissor(cur_scissor[0], cur_scissor[1], cur_scissor[2], cur_scissor[3]);
++    if (scissor_on) glEnable(GL_SCISSOR_TEST);
++    if (depth_on) glEnable(GL_DEPTH_TEST);
++    if (blend_on) glEnable(GL_BLEND);
++    glDepthMask(current_depth_mask ? GL_TRUE : GL_FALSE);
++    if (current_prg) {
++        gfx_opengl_load_shader(current_prg);
++    } else {
++        glUseProgram(0);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Init / frame
++// ---------------------------------------------------------------------------------------------
++
++static bool gles2_has_ext(const char* exts, const char* name) {
++    if (!exts) {
++        return false;
++    }
++    const size_t len = strlen(name);
++    for (const char* p = strstr(exts, name); p; p = strstr(p + 1, name)) {
++        if ((p == exts || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0')) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void gfx_opengl_init(void) {
++    const char* version = (const char*)glGetString(GL_VERSION);
++    const char* vendor = (const char*)glGetString(GL_VENDOR);
++    const char* renderer = (const char*)glGetString(GL_RENDERER);
++    const char* glsl = (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION);
++    const char* exts = (const char*)glGetString(GL_EXTENSIONS);
++    sysLogPrintf(LOG_NOTE, "GLES2: version: %s", version ? version : "unknown");
++    sysLogPrintf(LOG_NOTE, "GLES2: vendor: %s", vendor ? vendor : "unknown");
++    sysLogPrintf(LOG_NOTE, "GLES2: renderer: %s", renderer ? renderer : "unknown");
++    sysLogPrintf(LOG_NOTE, "GLES2: GLSL version: %s", glsl ? glsl : "unknown");
++    sysLogPrintf(LOG_NOTE, "GLES2: extensions: %s", exts ? exts : "none");
++
++    gl_npot_full = gles2_has_ext(exts, "GL_OES_texture_npot") || gles2_has_ext(exts, "GL_ARB_texture_non_power_of_two");
++    gl_has_aniso = gles2_has_ext(exts, "GL_EXT_texture_filter_anisotropic");
++    gl_has_depth24 = gles2_has_ext(exts, "GL_OES_depth24");
++    gl_highp_fs = gles2_has_ext(exts, "GL_OES_fragment_precision_high");
++    {
++        GLint range[2] = { 0, 0 }, precision = 0;
++        glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &precision);
++        gl_highp_fs = gl_highp_fs || precision > 0;
++    }
++
++    GLint max_attribs = 0, max_varyings = 0, max_tex = 0;
++    glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &max_attribs);
++    glGetIntegerv(GL_MAX_VARYING_VECTORS, &max_varyings);
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
++    sysLogPrintf(LOG_NOTE, "GLES2: npot %d, aniso %d, depth24 %d, highp fs %d, attribs %d, varyings %d, max tex %d",
++                 gl_npot_full, gl_has_aniso, gl_has_depth24, gl_highp_fs, max_attribs, max_varyings, max_tex);
++
++    // 24-bit depth if advertised; update_framebuffer_parameters() drops to 16 bits if the
++    // framebuffer turns out incomplete with it
++    gl_depth_format = gl_has_depth24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16;
++
++    // GL_MIRROR_CLAMP_TO_EDGE does not exist in GLES2
++    gl_mirror_clamp = GL_MIRRORED_REPEAT;
++
++    glGenBuffers(1, &opengl_vbo);
++    glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
++
++    gles2_init_blit();
++
++    glActiveTexture(GL_TEXTURE0);
++    active_tile = 0;
++
++    glDepthFunc(GL_LEQUAL);
++    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++
++    framebuffers.resize(1); // the window surface
++    framebuffers[0].fbo = 0;
++}
++
++static void gfx_opengl_on_resize(void) {
++}
++
++static void gfx_opengl_start_frame(void) {
++    frame_count++;
++}
++
++static void gfx_opengl_end_frame(void) {
++    glFlush();
++}
++
++static void gfx_opengl_finish_render(void) {
++}
++
++// ---------------------------------------------------------------------------------------------
++// Framebuffers
++// ---------------------------------------------------------------------------------------------
++
++static int gfx_opengl_create_framebuffer() {
++    size_t i = framebuffers.size();
++    framebuffers.resize(i + 1);
++
++    GLuint clrbuf;
++    glGenTextures(1, &clrbuf);
++    glBindTexture(GL_TEXTURE_2D, clrbuf);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glBindTexture(GL_TEXTURE_2D, bound_tex[active_tile]);
++    framebuffers[i].clrbuf = clrbuf;
++    tex_sizes[clrbuf] = { 1, 1 };
++
++    if (!gfx_framebuffers_enabled) {
++        return i;
++    }
++
++    glGenRenderbuffers(1, &framebuffers[i].rbo);
++    glGenFramebuffers(1, &framebuffers[i].fbo);
++
++    return i;
++}
++
++static void gles2_alloc_depth(GLuint rbo, uint32_t width, uint32_t height) {
++    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
++    glRenderbufferStorage(GL_RENDERBUFFER, gl_depth_format, width, height);
++    glBindRenderbuffer(GL_RENDERBUFFER, 0);
++}
++
++static void gfx_opengl_update_framebuffer_parameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
++                                                     bool opengl_invert_y, bool render_target, bool has_depth_buffer,
++                                                     bool can_extract_depth) {
++    Framebuffer& fb = framebuffers[fb_id];
++
++    width = max(width, 1U);
++    height = max(height, 1U);
++    msaa_level = 1; // no multisampled renderbuffers in GLES2
++
++    if (fb_id != 0 && gfx_framebuffers_enabled) {
++        glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
++
++        const bool resized = fb.width != width || fb.height != height;
++
++        if (resized) {
++            glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
++            glBindTexture(GL_TEXTURE_2D, bound_tex[active_tile]);
++            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
++            tex_sizes[fb.clrbuf] = { width, height };
++        }
++
++        if (has_depth_buffer && (resized || !fb.has_depth_buffer)) {
++            gles2_alloc_depth(fb.rbo, width, height);
++        }
++
++        if (!fb.has_depth_buffer && has_depth_buffer) {
++            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fb.rbo);
++        } else if (fb.has_depth_buffer && !has_depth_buffer) {
++            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
++        }
++
++        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++        if (status != GL_FRAMEBUFFER_COMPLETE && has_depth_buffer && gl_depth_format != GL_DEPTH_COMPONENT16) {
++            // a deeper format is advertised but not renderable (seen with depth32 on PS4)
++            sysLogPrintf(LOG_WARNING, "GLES2: framebuffer incomplete (0x%04x) with depth format 0x%04x, using 16 bits",
++                         status, gl_depth_format);
++            gl_depth_format = GL_DEPTH_COMPONENT16;
++            gles2_alloc_depth(fb.rbo, width, height);
++            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fb.rbo);
++            status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++        }
++        if (status != GL_FRAMEBUFFER_COMPLETE) {
++            sysLogPrintf(LOG_ERROR, "GLES2: framebuffer %d (%ux%u) incomplete: 0x%04x", fb_id, width, height, status);
++        }
++
++        glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[current_framebuffer].fbo);
++    } else if (fb_id != 0) {
++        has_depth_buffer = false;
++    }
++
++    fb.width = width;
++    fb.height = height;
++    fb.has_depth_buffer = has_depth_buffer;
++    fb.msaa_level = msaa_level;
++    fb.invert_y = opengl_invert_y;
++}
++
++bool gfx_opengl_start_draw_to_framebuffer(int fb_id, float noise_scale) {
++    if (fb_id < (int)framebuffers.size() && (fb_id == 0 || gfx_framebuffers_enabled)) {
++        Framebuffer& fb = framebuffers[fb_id];
++        if (noise_scale != 0.0f) {
++            current_noise_scale = 1.0f / noise_scale;
++        }
++        glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
++        current_framebuffer = fb_id;
++        return true;
++    }
++    return false;
++}
++
++void gfx_opengl_clear_framebuffer(bool clear_color, bool clear_depth) {
++    glDisable(GL_SCISSOR_TEST);
++
++    GLbitfield mask = 0;
++    if (clear_color) {
++        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++        mask |= GL_COLOR_BUFFER_BIT;
++    }
++    if (clear_depth) {
++        glDepthMask(GL_TRUE);
++        mask |= GL_DEPTH_BUFFER_BIT;
++    }
++    glClear(mask);
++    if (clear_depth) {
++        glDepthMask(current_depth_mask ? GL_TRUE : GL_FALSE);
++    }
++
++    glEnable(GL_SCISSOR_TEST);
++}
++
++// With no MSAA this is "present the offscreen game framebuffer": a straight 1:1 copy.
++void gfx_opengl_resolve_msaa_color_buffer(int fb_id_target, int fb_id_source) {
++    if (!gfx_framebuffers_enabled || fb_id_source == 0) {
++        return;
++    }
++    const Framebuffer& src = framebuffers[fb_id_source];
++    const Framebuffer& dst = framebuffers[fb_id_target];
++    gles2_blit(src.clrbuf, src.width, src.height, 0, 0, src.width, src.height,
++               dst.fbo, dst.width, dst.height, 0, 0, dst.width, dst.height, false);
++}
++
++void* gfx_opengl_get_framebuffer_texture_id(int fb_id) {
++    return (void*)(uintptr_t)framebuffers[fb_id].clrbuf;
++}
++
++void gfx_opengl_select_texture_fb(int fb_id) {
++    gles2_set_active_tile(0);
++    glBindTexture(GL_TEXTURE_2D, framebuffers[fb_id].clrbuf);
++    bound_tex[0] = framebuffers[fb_id].clrbuf;
++    current_textures_linear_filter[0] = true;
++}
++
++void gfx_opengl_copy_framebuffer(int fb_dst, int fb_src, int left, int top, bool flip_y, bool use_back) {
++    if (!gfx_framebuffers_enabled || fb_dst >= (int)framebuffers.size() || fb_src >= (int)framebuffers.size()) {
++        return;
++    }
++
++    const Framebuffer& src = framebuffers[fb_src];
++    const Framebuffer& dst = framebuffers[fb_dst];
++
++    int srcX0, srcY0, srcX1, srcY1;
++    int dstX0 = 0, dstY0 = 0, dstX1 = dst.width, dstY1 = dst.height;
++
++    if (left >= 0 && top >= 0) {
++        // unscaled rect copy
++        srcX0 = left;
++        srcY0 = top;
++        srcX1 = left + dst.width;
++        srcY1 = top + dst.height;
++    } else {
++        // scaled full copy
++        srcX0 = 0;
++        srcY0 = 0;
++        srcX1 = src.width;
++        srcY1 = src.height;
++    }
++
++    if (flip_y) {
++        std::swap(dstY0, dstY1);
++    }
++
++    if (fb_src == 0) {
++        // The window surface cannot be sampled, and glCopyTexSubImage2D from it stalls Piglet for
++        // seconds. gfx_pc.cpp redirects these copies to the offscreen game framebuffer on PS4, so
++        // this can only happen before the first frame: skip the copy (the target keeps its old
++        // contents, at worst a stale blur) rather than freeze.
++        static bool warned = false;
++        if (!warned) {
++            sysLogPrintf(LOG_WARNING, "GLES2: skipped a copy from the window surface (fb %d)", fb_dst);
++            warned = true;
++        }
++        return;
++    }
++
++    gles2_blit(src.clrbuf, src.width, src.height, srcX0, srcY0, srcX1, srcY1,
++               dst.fbo, dst.width, dst.height, dstX0, dstY0, dstX1, dstY1, false);
++}
++
++void gfx_opengl_set_texture_filter(FilteringMode mode) {
++    current_filter_mode = mode;
++}
++
++FilteringMode gfx_opengl_get_texture_filter(void) {
++    return current_filter_mode;
++}
++
++void gfx_opengl_set_mipmap_filter(MipmapFilteringMode mode) {
++    current_mipmap_filter_mode = mode;
++}
++
++static int gfx_opengl_get_max_anisotropy_level() {
++    if (!gl_has_aniso) {
++        return 1;
++    }
++    GLfloat max_aniso_level = 1.f;
++    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &max_aniso_level);
++    return (int)max_aniso_level;
++}
++
++static void gfx_opengl_set_anisotropy_level(int level) {
++    current_anisotropy_level = level;
++}
++
++static const char* gfx_gles2_get_name() {
++    return "OpenGL ES 2.0";
++}
++
++struct GfxRenderingAPI gfx_gles2_api = {
++    gfx_gles2_get_name,
++    gfx_opengl_get_max_texture_size,
++    gfx_opengl_get_clip_parameters,
++    gfx_opengl_unload_shader,
++    gfx_opengl_load_shader,
++    gfx_opengl_create_and_load_new_shader,
++    gfx_opengl_lookup_shader,
++    gfx_opengl_shader_get_info,
++    gfx_opengl_clear_shaders,
++    gfx_opengl_new_texture,
++    gfx_opengl_select_texture,
++    gfx_opengl_upload_texture,
++    gfx_opengl_set_sampler_parameters,
++    gfx_opengl_set_depth_mode,
++    gfx_opengl_set_depth_range,
++    gfx_opengl_set_viewport,
++    gfx_opengl_set_scissor,
++    gfx_opengl_set_use_alpha,
++    gfx_opengl_draw_triangles,
++    gfx_opengl_init,
++    gfx_opengl_on_resize,
++    gfx_opengl_start_frame,
++    gfx_opengl_end_frame,
++    gfx_opengl_finish_render,
++    gfx_opengl_create_framebuffer,
++    gfx_opengl_update_framebuffer_parameters,
++    gfx_opengl_start_draw_to_framebuffer,
++    gfx_opengl_copy_framebuffer,
++    gfx_opengl_clear_framebuffer,
++    gfx_opengl_resolve_msaa_color_buffer,
++    gfx_opengl_get_framebuffer_texture_id,
++    gfx_opengl_select_texture_fb,
++    gfx_opengl_delete_texture,
++    gfx_opengl_set_texture_filter,
++    gfx_opengl_get_texture_filter,
++    gfx_opengl_set_mipmap_filter,
++    gfx_opengl_set_anisotropy_level,
++    gfx_opengl_get_max_anisotropy_level
++};
++
++#endif // PLATFORM_PS4
+diff --git a/port/fast3d/gfx_gles2.h b/port/fast3d/gfx_gles2.h
+new file mode 100644
+index 0000000..906f1ee
+--- /dev/null
++++ b/port/fast3d/gfx_gles2.h
+@@ -0,0 +1,8 @@
++#ifndef GFX_GLES2_H
++#define GFX_GLES2_H
++
++#include "gfx_rendering_api.h"
++
++extern struct GfxRenderingAPI gfx_gles2_api;
++
++#endif
+diff --git a/port/fast3d/gfx_pc.cpp b/port/fast3d/gfx_pc.cpp
+index e0f6673..6c0dc7a 100644
+--- a/port/fast3d/gfx_pc.cpp
++++ b/port/fast3d/gfx_pc.cpp
+@@ -25,6 +25,15 @@
+ 
+ #include "platform.h"
+ 
++// Render the game into an offscreen framebuffer even without MSAA or scaling, and present it at
++// the end of the frame. Needed where the window surface can't be read back efficiently (PS4:
++// copying from it takes seconds), since several effects copy the current frame.
++#ifdef PLATFORM_PS4
++#define GFX_ALWAYS_OFFSCREEN 1
++#else
++#define GFX_ALWAYS_OFFSCREEN 0
++#endif
++
+ #include "gfx_pc.h"
+ #include "gfx_cc.h"
+ #include "gfx_window_manager_api.h"
+@@ -1684,7 +1693,7 @@ static void gfx_adjust_viewport_or_scissor(XYWidthHeight* area, bool preserve_as
+     }
+ 
+     if (!game_renders_to_framebuffer ||
+-        (gfx_msaa_level > 1 && gfx_current_dimensions.width == gfx_current_game_window_viewport.width &&
++        ((gfx_msaa_level > 1 || GFX_ALWAYS_OFFSCREEN) && gfx_current_dimensions.width == gfx_current_game_window_viewport.width &&
+             gfx_current_dimensions.height == gfx_current_game_window_viewport.height)) {
+         area->x += gfx_current_game_window_viewport.x;
+         area->y += gfx_current_window_dimensions.height -
+@@ -2631,7 +2640,7 @@ extern "C" void gfx_start_frame(void) {
+ 
+     bool different_size = gfx_current_dimensions.width != gfx_current_game_window_viewport.width ||
+                           gfx_current_dimensions.height != gfx_current_game_window_viewport.height;
+-    if (gfx_framebuffers_enabled && (different_size || gfx_msaa_level > 1)) {
++    if (gfx_framebuffers_enabled && (different_size || gfx_msaa_level > 1 || GFX_ALWAYS_OFFSCREEN)) {
+         game_renders_to_framebuffer = true;
+         if (different_size) {
+             gfx_rapi->update_framebuffer_parameters(game_framebuffer, gfx_current_dimensions.width,
+@@ -2690,7 +2699,7 @@ extern "C" void gfx_run(Gfx* commands) {
+         gfx_rapi->start_draw_to_framebuffer(0, 1);
+         gfx_rapi->clear_framebuffer(true, true);
+ 
+-        if (gfx_msaa_level > 1) {
++        if (gfx_msaa_level > 1 || GFX_ALWAYS_OFFSCREEN) {
+             bool different_size = gfx_current_dimensions.width != gfx_current_game_window_viewport.width ||
+                                   gfx_current_dimensions.height != gfx_current_game_window_viewport.height;
+ 
+@@ -2787,7 +2796,12 @@ extern "C" void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top,
+             // flip Y
+             top = gfx_current_dimensions.height - top - 1;
+         }
+-        if (use_back && gfx_msaa_level > 1) {
++        if (GFX_ALWAYS_OFFSCREEN && game_renders_to_framebuffer) {
++            // Both the back buffer (current frame, use_back) and the front buffer (the frame last
++            // presented, e.g. videoCopyFramebuffer() between frames) are the game framebuffer's
++            // contents: it is only cleared when the next frame starts. Never read the window.
++            fb_src = game_framebuffer;
++        } else if (use_back && gfx_msaa_level > 1) {
+             // read from the framebuffer we've been rendering to
+             fb_src = game_framebuffer;
+         }
+diff --git a/port/fast3d/gfx_ps4.cpp b/port/fast3d/gfx_ps4.cpp
+new file mode 100644
+index 0000000..fcea92a
+--- /dev/null
++++ b/port/fast3d/gfx_ps4.cpp
+@@ -0,0 +1,283 @@
++// PS4 window backend. The GLES2 context and the window surface come from Piglet (see
++// port/src/ps4/ps4platform.c); SDL only provides events, timing and the game controller API
++// (built with its dummy video driver).
++
++#include "platform.h"
++
++#ifdef PLATFORM_PS4
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <SDL.h>
++
++#include "system.h"
++#include "ps4platform.h"
++
++#include "gfx_window_manager_api.h"
++#include "gfx_screen_config.h"
++
++static SDL_Window *wnd;
++static int window_width = PS4_DISPLAY_WIDTH;
++static int window_height = PS4_DISPLAY_HEIGHT;
++static void (*on_fullscreen_changed_callback)(bool is_now_fullscreen);
++
++static int target_fps = 60;
++static uint64_t previous_time;
++static uint64_t qpc_freq;
++static uint32_t frames_presented;
++
++static bool system_splash_hidden;
++
++#define FRAME_INTERVAL_US_NUMERATOR 1000000
++#define FRAME_INTERVAL_US_DENOMINATOR (target_fps)
++
++static void gfx_ps4_init(const struct GfxWindowInitSettings *set) {
++    // Piglet always presents a 1080p surface; the system scales it to the actual video output.
++    (void)set;
++    window_width = PS4_DISPLAY_WIDTH;
++    window_height = PS4_DISPLAY_HEIGHT;
++
++    // the only video driver SDL has on this platform, and it has to be asked for by name
++    SDL_SetHint(SDL_HINT_VIDEODRIVER, "dummy");
++    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
++        sysLogPrintf(LOG_ERROR, "SDL_Init failed: %s", SDL_GetError());
++    }
++
++    // only exists so SDL has a window to attach events to
++    wnd = SDL_CreateWindow(set->title, 0, 0, window_width, window_height, SDL_WINDOW_SHOWN);
++    if (!wnd) {
++        sysLogPrintf(LOG_WARNING, "SDL_CreateWindow failed: %s", SDL_GetError());
++    }
++
++    if (ps4GfxInit(window_width, window_height) != 0) {
++        sysFatalError("Could not create the OpenGL ES context.\nSee " PS4_DATA_DIR "/ps4_boot.log and pd.log.");
++    }
++
++    qpc_freq = SDL_GetPerformanceFrequency();
++}
++
++static void gfx_ps4_close(void) {
++}
++
++static int gfx_ps4_get_display_mode(int modenum, int *out_w, int *out_h) {
++    if (modenum != 0) {
++        return 0;
++    }
++    *out_w = window_width;
++    *out_h = window_height;
++    return 1;
++}
++
++static int gfx_ps4_get_current_display_mode(int *out_w, int *out_h) {
++    *out_w = window_width;
++    *out_h = window_height;
++    return 1;
++}
++
++static int gfx_ps4_get_num_display_modes(void) {
++    return 1;
++}
++
++static int32_t gfx_ps4_get_fullscreen_state(void) {
++    return 1;
++}
++
++static void gfx_ps4_set_fullscreen_changed_callback(void (*cb)(bool is_now_fullscreen)) {
++    on_fullscreen_changed_callback = cb;
++}
++
++static void gfx_ps4_set_fullscreen(bool enable) {
++    (void)enable; // always full screen
++}
++
++static void gfx_ps4_set_fullscreen_exclusive(bool enable) {
++    (void)enable;
++}
++
++static void gfx_ps4_set_fullscreen_flag(int32_t mode) {
++    (void)mode;
++}
++
++static int32_t gfx_ps4_get_fullscreen_flag_mode(void) {
++    return 1;
++}
++
++static int32_t gfx_ps4_get_maximized_state(void) {
++    return 0;
++}
++
++static void gfx_ps4_set_maximize(bool enable) {
++    (void)enable;
++}
++
++static void gfx_ps4_get_active_window_refresh_rate(uint32_t *refresh_rate) {
++    *refresh_rate = 60;
++}
++
++static void gfx_ps4_set_cursor_visibility(bool visible) {
++    (void)visible;
++}
++
++static void gfx_ps4_set_closest_resolution(int32_t width, int32_t height, bool should_center) {
++    (void)width;
++    (void)height;
++    (void)should_center;
++}
++
++static void gfx_ps4_set_dimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) {
++    (void)width;
++    (void)height;
++    (void)posX;
++    (void)posY;
++}
++
++static void gfx_ps4_get_dimensions(uint32_t *width, uint32_t *height, int32_t *posX, int32_t *posY) {
++    *width = (uint32_t)window_width;
++    *height = (uint32_t)window_height;
++    *posX = 0;
++    *posY = 0;
++}
++
++static void gfx_ps4_get_centered_positions(int32_t width, int32_t height, int32_t *posX, int32_t *posY) {
++    *posX = window_width / 2 - width / 2;
++    *posY = window_height / 2 - height / 2;
++}
++
++static void gfx_ps4_handle_events(void) {
++    SDL_Event event;
++    // controllers coming and going (users logging in/out, pads switched on/off)
++    ps4PadPoll();
++    // also runs the virtual joysticks' Update callbacks (scePad polling)
++    while (SDL_PollEvent(&event)) {
++        if (event.type == SDL_QUIT) {
++            exit(0);
++        }
++    }
++}
++
++static bool gfx_ps4_start_frame(void) {
++    return true;
++}
++
++static uint64_t qpc_to_100ns(uint64_t qpc) {
++    return qpc / qpc_freq * 10000000 + qpc % qpc_freq * 10000000 / qpc_freq;
++}
++
++static inline void sync_framerate_with_timer(void) {
++    uint64_t t = qpc_to_100ns(SDL_GetPerformanceCounter());
++
++    const int64_t next = previous_time + 10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;
++    int64_t left = next - t;
++    // exit a bit early and busy-wait the rest so the deadline is never missed
++    left -= 15000UL;
++    if (left > 0) {
++        sysSleep(left);
++    }
++
++    do {
++        sysCpuRelax();
++        t = qpc_to_100ns(SDL_GetPerformanceCounter());
++    } while ((int64_t)t < next);
++
++    t = qpc_to_100ns(SDL_GetPerformanceCounter());
++    if (left > 0 && t - next < 10000) {
++        t = next;
++    }
++    previous_time = t;
++}
++
++static void gfx_ps4_swap_buffers_begin(void) {
++    if (target_fps && !ps4GfxVsyncActive()) {
++        sync_framerate_with_timer();
++    }
++
++    ps4GfxSwapBuffers();
++
++    // The system shows the package's sce_sys/pic1.png from launch until it is told to stop:
++    // keep it up until the first game frame is on screen, so loading isn't a black screen.
++    if (!system_splash_hidden) {
++        ps4HideSplashScreen();
++        system_splash_hidden = true;
++    }
++
++    ++frames_presented;
++    if (frames_presented <= 3) {
++        sysLogPrintf(LOG_NOTE, "PS4: frame %u presented", frames_presented);
++    } else if (frames_presented % 36000 == 0) {
++        ps4LogMemory("while running");
++    }
++}
++
++static void gfx_ps4_swap_buffers_end(void) {
++}
++
++static double gfx_ps4_get_time(void) {
++    return SDL_GetPerformanceCounter() / (double)qpc_freq;
++}
++
++static int32_t gfx_ps4_get_target_fps(void) {
++    return target_fps;
++}
++
++static void gfx_ps4_set_target_fps(int fps) {
++    target_fps = fps;
++}
++
++static bool gfx_ps4_can_disable_vsync(void) {
++    return true;
++}
++
++static void *gfx_ps4_get_window_handle(void) {
++    return (void *)wnd;
++}
++
++static void gfx_ps4_set_window_title(const char *title) {
++    (void)title;
++}
++
++static int gfx_ps4_get_swap_interval(void) {
++    return ps4GfxVsyncActive();
++}
++
++static bool gfx_ps4_set_swap_interval(int interval) {
++    // The swap interval can only be chosen before the EGL surface exists (see ps4GfxInit):
++    // report success only for the one that is actually in effect, so the game falls back to its
++    // own frame limiter otherwise.
++    return (interval != 0) == (ps4GfxVsyncActive() != 0);
++}
++
++struct GfxWindowManagerAPI gfx_ps4 = {
++    gfx_ps4_init,
++    gfx_ps4_close,
++    gfx_ps4_get_display_mode,
++    gfx_ps4_get_current_display_mode,
++    gfx_ps4_get_num_display_modes,
++    gfx_ps4_get_fullscreen_state,
++    gfx_ps4_set_fullscreen_changed_callback,
++    gfx_ps4_set_fullscreen,
++    gfx_ps4_set_fullscreen_exclusive,
++    gfx_ps4_set_fullscreen_flag,
++    gfx_ps4_get_fullscreen_flag_mode,
++    gfx_ps4_get_maximized_state,
++    gfx_ps4_set_maximize,
++    gfx_ps4_get_active_window_refresh_rate,
++    gfx_ps4_set_cursor_visibility,
++    gfx_ps4_set_closest_resolution,
++    gfx_ps4_set_dimensions,
++    gfx_ps4_get_dimensions,
++    gfx_ps4_get_centered_positions,
++    gfx_ps4_handle_events,
++    gfx_ps4_start_frame,
++    gfx_ps4_swap_buffers_begin,
++    gfx_ps4_swap_buffers_end,
++    gfx_ps4_get_time,
++    gfx_ps4_get_target_fps,
++    gfx_ps4_set_target_fps,
++    gfx_ps4_can_disable_vsync,
++    gfx_ps4_get_window_handle,
++    gfx_ps4_set_window_title,
++    gfx_ps4_get_swap_interval,
++    gfx_ps4_set_swap_interval,
++};
++
++#endif // PLATFORM_PS4
+diff --git a/port/fast3d/gfx_ps4.h b/port/fast3d/gfx_ps4.h
+new file mode 100644
+index 0000000..fd82127
+--- /dev/null
++++ b/port/fast3d/gfx_ps4.h
+@@ -0,0 +1,8 @@
++#ifndef GFX_PS4_H
++#define GFX_PS4_H
++
++#include "gfx_window_manager_api.h"
++
++extern struct GfxWindowManagerAPI gfx_ps4;
++
++#endif
+diff --git a/port/include/ps4platform.h b/port/include/ps4platform.h
+new file mode 100644
+index 0000000..c79e088
+--- /dev/null
++++ b/port/include/ps4platform.h
+@@ -0,0 +1,47 @@
++#ifndef _IN_PS4PLATFORM_H
++#define _IN_PS4PLATFORM_H
++
++// PS4 platform layer (OpenOrbis): system modules, Piglet/EGL, DualShock 4, memory stats.
++// Only compiled when PLATFORM_PS4 is defined.
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include <stdint.h>
++
++// Everything the game reads and writes (ROM, config, saves, logs) lives here.
++#define PS4_DATA_DIR "/data/perfectdark"
++// Piglet presents to a fixed 1080p surface, the system scales it to the actual output.
++#define PS4_DISPLAY_WIDTH 1920
++#define PS4_DISPLAY_HEIGHT 1080
++
++// Loads the system modules and the Piglet + shader compiler pair, configures Piglet and creates
++// a GLES2 context on a full screen window surface. Returns 0 on success.
++int ps4GfxInit(int width, int height);
++void ps4GfxSwapBuffers(void);
++void ps4GfxShutdown(void);
++// 1 if the context was created with a swap interval of 1 (see ps4GfxInit).
++int ps4GfxVsyncActive(void);
++
++// Initial (logged in) user, or -1.
++int32_t ps4GetUserId(void);
++
++// Opens the DualShock 4 of every logged-in user (initial user first, up to 4) and exposes each
++// connected one to SDL as a virtual game controller, so the regular SDL input code handles them.
++// Call after SDL_INIT_GAMECONTROLLER.
++void ps4PadAttach(void);
++// Picks up users logging in/out and controllers being switched on/off. Call every frame; it
++// rate-limits itself.
++void ps4PadPoll(void);
++
++// The system shows the boot splash until the application hides it.
++void ps4HideSplashScreen(void);
++
++void ps4LogMemory(const char *when);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/port/src/audio.c b/port/src/audio.c
+index c66cf59..195681d 100644
+--- a/port/src/audio.c
++++ b/port/src/audio.c
+@@ -1,11 +1,161 @@
+ #include <PR/ultratypes.h>
+ #include <stdio.h>
+-#include <SDL.h>
+ #include "platform.h"
+ #include "config.h"
+ #include "audio.h"
+ #include "system.h"
+ 
++#ifdef PLATFORM_PS4
++
++// PS4: SDL has no audio driver here, so samples go to sceAudioOut directly. The main port only
++// accepts 48 kHz; the game mixes at 22020 Hz. A feeder thread resamples (linear interpolation)
++// and hands 256-frame blocks to the system, which blocks until the previous block has played.
++
++#include <pthread.h>
++#include <string.h>
++#include <orbis/AudioOut.h>
++
++#define PS4_AUDIO_SRC_RATE 22020
++#define PS4_AUDIO_OUT_RATE 48000
++#define PS4_AUDIO_GRANULARITY 256
++#define PS4_AUDIO_RING_FRAMES 32768 // must be a power of two
++#define PS4_AUDIO_SYSTEM_USER 0xFF
++
++static s32 bufferSize = 512;
++static s32 queueLimit = 8192;
++
++static const s16 *nextBuf;
++static u32 nextSize = 0;
++
++static s16 ring[PS4_AUDIO_RING_FRAMES * 2];
++static u32 ringRead = 0;  // in frames, wraps naturally
++static u32 ringWrite = 0;
++static pthread_mutex_t ringLock = PTHREAD_MUTEX_INITIALIZER;
++static s32 audioPort = -1;
++static volatile s32 audioRunning = 0;
++
++static inline u32 ringCount(void)
++{
++	return ringWrite - ringRead;
++}
++
++static void *audioFeeder(void *arg)
++{
++	(void)arg;
++	static s16 block[PS4_AUDIO_GRANULARITY * 2];
++	const f64 step = (f64)PS4_AUDIO_SRC_RATE / (f64)PS4_AUDIO_OUT_RATE;
++	f64 pos = 0.0; // fractional read position relative to ringRead
++
++	while (audioRunning) {
++		pthread_mutex_lock(&ringLock);
++		const u32 avail = ringCount();
++		for (u32 i = 0; i < PS4_AUDIO_GRANULARITY; ++i) {
++			const u32 idx = (u32)pos;
++			if (idx + 1 < avail) {
++				const f64 frac = pos - (f64)idx;
++				const s16 *a = &ring[((ringRead + idx) & (PS4_AUDIO_RING_FRAMES - 1)) * 2];
++				const s16 *b = &ring[((ringRead + idx + 1) & (PS4_AUDIO_RING_FRAMES - 1)) * 2];
++				block[i * 2 + 0] = (s16)(a[0] + (b[0] - a[0]) * frac);
++				block[i * 2 + 1] = (s16)(a[1] + (b[1] - a[1]) * frac);
++				pos += step;
++			} else {
++				// underrun: silence until the game catches up
++				block[i * 2 + 0] = 0;
++				block[i * 2 + 1] = 0;
++			}
++		}
++		u32 consumed = (u32)pos;
++		if (consumed > avail) {
++			consumed = avail;
++		}
++		ringRead += consumed;
++		pos -= (f64)consumed;
++		if (pos >= 1.0) {
++			pos = 0.0;
++		}
++		pthread_mutex_unlock(&ringLock);
++
++		sceAudioOutOutput(audioPort, block);
++	}
++
++	return NULL;
++}
++
++s32 audioInit(void)
++{
++	sceAudioOutInit(); // "already initialized" is fine
++
++	audioPort = sceAudioOutOpen(PS4_AUDIO_SYSTEM_USER, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0,
++		PS4_AUDIO_GRANULARITY, PS4_AUDIO_OUT_RATE, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
++	if (audioPort < 0) {
++		sysLogPrintf(LOG_ERROR, "PS4: sceAudioOutOpen failed: 0x%08x", (u32)audioPort);
++		audioPort = -1;
++		return -1;
++	}
++
++	nextBuf = NULL;
++	ringRead = ringWrite = 0;
++	audioRunning = 1;
++
++	pthread_t thr;
++	if (pthread_create(&thr, NULL, audioFeeder, NULL) != 0) {
++		sysLogPrintf(LOG_ERROR, "PS4: could not start the audio thread");
++		audioRunning = 0;
++		sceAudioOutClose(audioPort);
++		audioPort = -1;
++		return -1;
++	}
++	pthread_detach(thr);
++
++	sysLogPrintf(LOG_NOTE, "PS4: audio: %d Hz stereo resampled to %d Hz", PS4_AUDIO_SRC_RATE, PS4_AUDIO_OUT_RATE);
++	return 0;
++}
++
++s32 audioGetBytesBuffered(void)
++{
++	pthread_mutex_lock(&ringLock);
++	const u32 n = ringCount();
++	pthread_mutex_unlock(&ringLock);
++	return (s32)(n * 4);
++}
++
++s32 audioGetSamplesBuffered(void)
++{
++	return audioGetBytesBuffered() / 4;
++}
++
++void audioSetNextBuffer(const s16 *buf, u32 len)
++{
++	nextBuf = buf;
++	nextSize = len;
++}
++
++void audioEndFrame(void)
++{
++	if (nextBuf && nextSize && audioPort >= 0) {
++		if (audioGetSamplesBuffered() < queueLimit) {
++			const u32 frames = nextSize / 4;
++			pthread_mutex_lock(&ringLock);
++			const u32 space = PS4_AUDIO_RING_FRAMES - ringCount();
++			const u32 n = frames < space ? frames : space;
++			for (u32 i = 0; i < n; ++i) {
++				const u32 w = ((ringWrite + i) & (PS4_AUDIO_RING_FRAMES - 1)) * 2;
++				ring[w + 0] = nextBuf[i * 2 + 0];
++				ring[w + 1] = nextBuf[i * 2 + 1];
++			}
++			ringWrite += n;
++			pthread_mutex_unlock(&ringLock);
++		}
++	}
++	nextBuf = NULL;
++	nextSize = 0;
++}
++
++#else // PLATFORM_PS4
++
++#include <SDL.h>
++
++
+ static SDL_AudioDeviceID dev;
+ static const s16 *nextBuf;
+ static u32 nextSize = 0;
+@@ -68,6 +218,8 @@ void audioEndFrame(void)
+ 	}
+ }
+ 
++#endif // PLATFORM_PS4
++
+ PD_CONSTRUCTOR static void audioConfigInit(void)
+ {
+ 	configRegisterInt("Audio.BufferSize", &bufferSize, 0, 1 * 1024 * 1024);
+diff --git a/port/src/input.c b/port/src/input.c
+index 0adad35..83786af 100644
+--- a/port/src/input.c
++++ b/port/src/input.c
+@@ -5,6 +5,9 @@
+ #include <PR/os_thread.h>
+ #include <PR/os_cont.h>
+ #include "platform.h"
++#ifdef PLATFORM_PS4
++#include "ps4platform.h"
++#endif
+ #include "input.h"
+ #include "video.h"
+ #include "config.h"
+@@ -724,6 +727,11 @@ s32 inputInit(void)
+ 		SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC);
+ 	}
+ 
++#ifdef PLATFORM_PS4
++	// the DualShock 4 is read with scePad and shows up here as an SDL virtual game controller
++	ps4PadAttach();
++#endif
++
+ 	// try to load controller db from an external file in the save folder
+ 	if (fsFileSize("$S/" CONTROLLERDB_FNAME)) {
+ 		const char *dbpath = fsFullPath("$S/" CONTROLLERDB_FNAME);
+diff --git a/port/src/main.c b/port/src/main.c
+index c8b959e..e5679d1 100644
+--- a/port/src/main.c
++++ b/port/src/main.c
+@@ -4,6 +4,7 @@
+ #include <PR/ultrasched.h>
+ #include <PR/os_message.h>
+ 
++#include "platform.h"
+ #include "lib/main.h"
+ #include "bss.h"
+ #include "data.h"
+@@ -93,7 +94,12 @@ static void cleanup(void)
+ 	// TODO: actually shut down all subsystems
+ }
+ 
++#ifdef PLATFORM_PS4
++// the process entry point is in port/src/ps4/ps4main.c
++int pdMain(int argc, const char **argv)
++#else
+ int main(int argc, const char **argv)
++#endif
+ {
+ 	sysInitArgs(argc, argv);
+ 
+diff --git a/port/src/ps4/ps4heap.c b/port/src/ps4/ps4heap.c
+new file mode 100644
+index 0000000..f3b6952
+--- /dev/null
++++ b/port/src/ps4/ps4heap.c
+@@ -0,0 +1,246 @@
++// PS4: give the C heap its own block of memory.
++//
++// The OpenOrbis C library (musl) takes all of its heap from anonymous mmap(). On PS4 those
++// mappings come out of the application's flexible memory (~255 MiB), which is also where Piglet
++// keeps textures and render targets when it is allowed to. mmap()/munmap() are therefore
++// replaced here: anonymous read/write mappings are carved out of one arena, everything else is
++// passed to the kernel.
++//
++// The arena comes from system flexible memory if the process may map it (a separate pool, which
++// leaves all of the direct memory to Piglet), otherwise from direct memory.
++//
++// Same idea as Ps4Heap.c in alechurri/shipofharkinian-ps4; this is a separate, smaller
++// implementation sized for Perfect Dark.
++
++#include "platform.h"
++
++#ifdef PLATFORM_PS4
++
++#include <errno.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++
++#include <orbis/libkernel.h>
++
++#define HEAP_PAGE 0x4000ULL                    // 16 KiB, the PS4 page size
++#define HEAP_ALIGN 0x200000ULL                 // 2 MiB, direct memory allocation alignment
++#define HEAP_SYSFLEX_SIZE (512ULL << 20)       // arena size when system flexible memory works
++#define HEAP_DIRECT_MAX (512ULL << 20)         // direct memory arena: try this, halve down to...
++#define HEAP_DIRECT_MIN (128ULL << 20)         // ...this
++#define HEAP_LARGE_PAGES 64                    // >= 1 MiB: allocate top-down
++#define HEAP_MAP_FIXED 0x10
++
++// Declared with the wrong prototype by the OpenOrbis headers.
++int32_t ps4heapMapNamedSystemFlexibleMemory(void **addr, size_t len, int32_t prot, int32_t flags, const char *name)
++	__asm__("sceKernelMapNamedSystemFlexibleMemory");
++
++static uint8_t *arenaBase;
++static size_t arenaPages;
++static uint8_t *pageMap;  // one byte per page, 1 = used; stored in the arena's first pages
++static size_t searchHint;
++static size_t pagesUsed;
++static size_t pagesPeak;
++static int initDone;
++static int arenaKind;     // 0 = none, 1 = system flexible, 2 = direct
++static volatile int heapLock;
++
++static inline void ps4heapLock(void)
++{
++	while (__sync_lock_test_and_set(&heapLock, 1)) {
++		while (heapLock) {
++			__builtin_ia32_pause();
++		}
++	}
++}
++
++static inline void ps4heapUnlock(void)
++{
++	__sync_lock_release(&heapLock);
++}
++
++static void ps4heapInit(void)
++{
++	initDone = 1;
++
++	size_t size = HEAP_SYSFLEX_SIZE;
++	void *addr = NULL;
++	if (sceKernelReserveVirtualRange(&addr, size, 0, HEAP_PAGE) == 0 && addr) {
++		if (ps4heapMapNamedSystemFlexibleMemory(&addr, size, ORBIS_KERNEL_PROT_CPU_RW, HEAP_MAP_FIXED, "pd heap") == 0) {
++			arenaBase = (uint8_t *)addr;
++			arenaKind = 1;
++		} else {
++			sceKernelMunmap(addr, size);
++		}
++	}
++
++	const size_t dmemSize = sceKernelGetDirectMemorySize();
++	for (size = HEAP_DIRECT_MAX; !arenaBase && size >= HEAP_DIRECT_MIN; size /= 2) {
++		off_t phys = 0;
++		int32_t ret = -1;
++		// prefer the top of physical memory, Piglet and the system libraries allocate from the bottom
++		if (dmemSize > size) {
++			ret = sceKernelAllocateDirectMemory((off_t)(dmemSize - size), (off_t)dmemSize, size, HEAP_ALIGN, ORBIS_KERNEL_WB_ONION, &phys);
++		}
++		if (ret != 0) {
++			ret = sceKernelAllocateDirectMemory(0, (off_t)dmemSize, size, HEAP_ALIGN, ORBIS_KERNEL_WB_ONION, &phys);
++		}
++		if (ret != 0) {
++			continue;
++		}
++		addr = NULL;
++		if (sceKernelMapDirectMemory(&addr, size, ORBIS_KERNEL_PROT_CPU_RW, 0, phys, HEAP_ALIGN) == 0) {
++			arenaBase = (uint8_t *)addr;
++			arenaKind = 2;
++			break;
++		}
++		sceKernelReleaseDirectMemory(phys, size);
++	}
++
++	if (!arenaBase) {
++		return;
++	}
++	if (arenaKind == 1) {
++		size = HEAP_SYSFLEX_SIZE;
++	}
++
++	arenaPages = size / HEAP_PAGE;
++	const size_t mapPages = (arenaPages + HEAP_PAGE - 1) / HEAP_PAGE;
++	pageMap = arenaBase;
++	memset(pageMap, 0, arenaPages);
++	memset(pageMap, 1, mapPages);
++	searchHint = mapPages;
++	pagesUsed = pagesPeak = mapPages;
++}
++
++static void *ps4heapAlloc(size_t len)
++{
++	const size_t pages = (len + HEAP_PAGE - 1) / HEAP_PAGE;
++	size_t first = (size_t)-1;
++
++	ps4heapLock();
++
++	if (!initDone) {
++		ps4heapInit();
++	}
++
++	if (arenaBase && pages && pages <= arenaPages) {
++		if (pages >= HEAP_LARGE_PAGES) {
++			// big blocks from the top so they don't fragment the small ones
++			size_t run = 0;
++			for (size_t i = arenaPages; i-- > 0;) {
++				run = pageMap[i] ? 0 : run + 1;
++				if (run == pages) {
++					first = i;
++					break;
++				}
++			}
++		} else {
++			// next fit from the bottom, wrapping around once
++			for (int pass = 0; pass < 2 && first == (size_t)-1; ++pass) {
++				const size_t start = pass ? 0 : searchHint;
++				const size_t end = pass ? searchHint + pages : arenaPages;
++				size_t run = 0;
++				for (size_t i = start; i < end && i < arenaPages; ++i) {
++					run = pageMap[i] ? 0 : run + 1;
++					if (run == pages) {
++						first = i + 1 - pages;
++						searchHint = i + 1;
++						break;
++					}
++				}
++			}
++		}
++
++		if (first != (size_t)-1) {
++			memset(pageMap + first, 1, pages);
++			pagesUsed += pages;
++			if (pagesUsed > pagesPeak) {
++				pagesPeak = pagesUsed;
++			}
++		}
++	}
++
++	ps4heapUnlock();
++
++	if (first == (size_t)-1) {
++		return NULL;
++	}
++
++	// anonymous mappings must read back as zeroes (calloc relies on it)
++	uint8_t *ret = arenaBase + first * HEAP_PAGE;
++	memset(ret, 0, pages * HEAP_PAGE);
++	return ret;
++}
++
++static int ps4heapOwns(const void *addr)
++{
++	return arenaBase && (const uint8_t *)addr >= arenaBase && (const uint8_t *)addr < arenaBase + arenaPages * HEAP_PAGE;
++}
++
++static void ps4heapFree(void *addr, size_t len)
++{
++	const size_t first = (size_t)((uint8_t *)addr - arenaBase) / HEAP_PAGE;
++	size_t pages = (len + HEAP_PAGE - 1) / HEAP_PAGE;
++
++	ps4heapLock();
++	if (first + pages > arenaPages) {
++		pages = arenaPages - first;
++	}
++	for (size_t i = first; i < first + pages; ++i) {
++		if (pageMap[i]) {
++			pageMap[i] = 0;
++			--pagesUsed;
++		}
++	}
++	if (first < searchHint) {
++		searchHint = first;
++	}
++	ps4heapUnlock();
++}
++
++void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
++{
++	if (!addr && fd == -1 && (flags & MAP_ANON) && !(flags & MAP_FIXED) && prot == (PROT_READ | PROT_WRITE)) {
++		void *ret = ps4heapAlloc(len);
++		if (ret) {
++			return ret;
++		}
++	}
++
++	void *mapped = NULL;
++	if (sceKernelMmap(addr, len, prot, flags, fd, off, &mapped) < 0) {
++		errno = ENOMEM;
++		return MAP_FAILED;
++	}
++	return mapped;
++}
++
++int munmap(void *addr, size_t len)
++{
++	if (ps4heapOwns(addr)) {
++		ps4heapFree(addr, len);
++		return 0;
++	}
++	if (sceKernelMunmap(addr, len) < 0) {
++		errno = EINVAL;
++		return -1;
++	}
++	return 0;
++}
++
++int ps4HeapGetKind(void)
++{
++	return arenaKind;
++}
++
++void ps4HeapGetStats(size_t *arena, size_t *inuse, size_t *peak)
++{
++	*arena = arenaPages * HEAP_PAGE;
++	*inuse = pagesUsed * HEAP_PAGE;
++	*peak = pagesPeak * HEAP_PAGE;
++}
++
++#endif // PLATFORM_PS4
+diff --git a/port/src/ps4/ps4main.c b/port/src/ps4/ps4main.c
+new file mode 100644
+index 0000000..414fa6d
+--- /dev/null
++++ b/port/src/ps4/ps4main.c
+@@ -0,0 +1,181 @@
++// PS4 process entry point: sets up the data directory and an early boot log, then runs the
++// game's own main() (renamed to pdMain on this platform) on a thread with a large stack.
++
++#include "platform.h"
++
++#ifdef PLATFORM_PS4
++
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <orbis/SystemService.h>
++
++#include "ps4platform.h"
++#include "versioninfo.h"
++
++extern int pdMain(int argc, const char **argv);
++extern void ps4HeapGetStats(size_t *arena, size_t *inuse, size_t *peak);
++
++// The decompiled game code recurses quite a bit; the default main thread stack is tight.
++#define PS4_GAME_STACK_SIZE (8 * 1024 * 1024)
++// stdout/stderr go here from the first instruction on, so failures before the game's own
++// log is open (Piglet setup in particular) still leave a trace. Piglet's own [PIG] messages
++// end up here as well.
++#define PS4_BOOT_LOG PS4_DATA_DIR "/ps4_boot.log"
++
++static int bootLogFd = -1;
++
++static void ps4BootLogRaw(const char *text)
++{
++	if (bootLogFd >= 0) {
++		write(bootLogFd, text, strlen(text));
++		fsync(bootLogFd);
++	}
++}
++
++static void ps4FatalSignal(int sig, siginfo_t *info, void *ctx)
++{
++	(void)ctx;
++	char line[160];
++	snprintf(line, sizeof(line), "PS4: FATAL: signal %d, fault address %p\n", sig, info ? info->si_addr : NULL);
++	ps4BootLogRaw(line);
++	signal(sig, SIG_DFL);
++	raise(sig);
++}
++
++static void ps4InstallBootLog(void)
++{
++	bootLogFd = open(PS4_BOOT_LOG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
++	if (bootLogFd >= 0) {
++		// same descriptor for both, so lines stay in order
++		dup2(bootLogFd, STDOUT_FILENO);
++		dup2(bootLogFd, STDERR_FILENO);
++	}
++	setvbuf(stdout, NULL, _IONBF, 0);
++	setvbuf(stderr, NULL, _IONBF, 0);
++
++	struct sigaction act;
++	memset(&act, 0, sizeof(act));
++	// the OpenOrbis header misspells its sa_sigaction macro; go through the union
++	act.__sa_handler.__sa_sigaction = ps4FatalSignal;
++	act.sa_flags = SA_SIGINFO;
++	const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
++	for (size_t i = 0; i < sizeof(sigs) / sizeof(*sigs); ++i) {
++		sigaction(sigs[i], &act, NULL);
++	}
++}
++
++// With the stock OpenOrbis headers stat() reported garbage sizes (see compat/ps4_fixups.h in the
++// build scripts). Compare stat() and lseek() on a file that is always there.
++static void ps4CheckFileSizes(void)
++{
++	const char *path = "/app0/eboot.bin";
++	struct stat st;
++	memset(&st, 0, sizeof(st));
++	const int sret = stat(path, &st);
++	long long seek = -1;
++	const int fd = open(path, O_RDONLY);
++	if (fd >= 0) {
++		seek = (long long)lseek(fd, 0, SEEK_END);
++		close(fd);
++	}
++	char line[200];
++	snprintf(line, sizeof(line), "PS4: file size check on %s: stat %s, st_size %lld, lseek %lld -> %s\n", path,
++		sret == 0 ? "ok" : "failed", (long long)st.st_size, seek,
++		(sret == 0 && (long long)st.st_size == seek) ? "consistent" : "MISMATCH");
++	ps4BootLogRaw(line);
++}
++
++static void ps4ReturnToSystem(void)
++{
++	size_t arena = 0, inuse = 0, peak = 0;
++	ps4HeapGetStats(&arena, &inuse, &peak);
++	printf("PS4: heap arena %zu MiB, in use %zu MiB, peak %zu MiB\n", arena >> 20, inuse >> 20, peak >> 20);
++	fflush(stdout);
++	// the orderly way back to the home screen
++	sceSystemServiceLoadExec("exit", NULL);
++}
++
++#define PS4_ROM_NAME "pd." VERSION_ROMID ".z64"
++// where earlier builds expected the ROM
++#define PS4_OLD_BASE_DIR PS4_DATA_DIR "/data"
++
++// The ROM (and pd.gbc) go straight into /data/perfectdark, next to pd.ini and the saves. Installs
++// that still have the ROM in the old data/ subfolder keep working.
++static const char *ps4ChooseBaseDir(void)
++{
++	if (access(PS4_DATA_DIR "/" PS4_ROM_NAME, F_OK) != 0 && access(PS4_OLD_BASE_DIR "/" PS4_ROM_NAME, F_OK) == 0) {
++		ps4BootLogRaw("PS4: ROM found in the old location " PS4_OLD_BASE_DIR "/, using that. "
++			"Move it to " PS4_DATA_DIR "/ when convenient.\n");
++		return PS4_OLD_BASE_DIR;
++	}
++	return PS4_DATA_DIR;
++}
++
++static void *ps4GameThread(void *arg)
++{
++	(void)arg;
++	ps4BootLogRaw("PS4: game thread started\n");
++
++	// Relative paths fail with EINVAL rather than ENOENT on PS4, so every location the game
++	// probes is given explicitly.
++	const char *argv[] = {
++		"/app0/eboot.bin",
++		"--log",
++		"--basedir", ps4ChooseBaseDir(),
++		"--savedir", PS4_DATA_DIR,
++		NULL
++	};
++	const int argc = (int)(sizeof(argv) / sizeof(*argv)) - 1;
++
++	pdMain(argc, argv);
++
++	ps4BootLogRaw("PS4: pdMain returned\n");
++	exit(0);
++	return NULL;
++}
++
++int main(int argc, char *argv[])
++{
++	(void)argc;
++	(void)argv;
++
++	if (mkdir(PS4_DATA_DIR, 0777) != 0 && errno != EEXIST) {
++		printf("PS4: could not create " PS4_DATA_DIR ": %s\n", strerror(errno));
++	}
++	if (chdir(PS4_DATA_DIR) != 0) {
++		printf("PS4: could not chdir to " PS4_DATA_DIR ": %s\n", strerror(errno));
++	}
++
++	ps4InstallBootLog();
++	ps4BootLogRaw("PS4: Perfect Dark boot\n");
++	ps4CheckFileSizes();
++
++	atexit(ps4ReturnToSystem);
++
++	pthread_attr_t attr;
++	pthread_attr_init(&attr);
++	pthread_attr_setstacksize(&attr, PS4_GAME_STACK_SIZE);
++
++	pthread_t thr;
++	const int ret = pthread_create(&thr, &attr, ps4GameThread, NULL);
++	pthread_attr_destroy(&attr);
++
++	if (ret != 0) {
++		printf("PS4: could not create the game thread (%d), running on the main thread\n", ret);
++		ps4GameThread(NULL);
++	} else {
++		pthread_join(thr, NULL);
++	}
++
++	return 0;
++}
++
++#endif // PLATFORM_PS4
+diff --git a/port/src/ps4/ps4platform.c b/port/src/ps4/ps4platform.c
+new file mode 100644
+index 0000000..d5dca77
+--- /dev/null
++++ b/port/src/ps4/ps4platform.c
+@@ -0,0 +1,695 @@
++// PS4 platform layer: system modules, Piglet (OpenGL ES 2.0 + EGL), DualShock 4.
++//
++// The approach (module pair from /data/self/system/common/lib, the Piglet configuration
++// fallback list, opt-in vsync guarded by a watchdog, scePad exposed through an SDL virtual
++// joystick) follows alechurri/shipofharkinian-ps4, which documents why each of these is
++// needed on real hardware: https://github.com/alechurri/shipofharkinian-ps4/blob/main/docs/TECHNICAL.md
++
++#include "platform.h"
++
++#ifdef PLATFORM_PS4
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <pthread.h>
++
++#include <SDL.h>
++
++#include <orbis/libkernel.h>
++#include <orbis/Pad.h>
++#include <stdbool.h> // Pigletv2VSH.h uses bool without including it
++#include <orbis/Pigletv2VSH.h>
++#include <orbis/SystemService.h>
++#include <orbis/UserService.h>
++
++#include "system.h"
++#include "ps4platform.h"
++
++// ---------------------------------------------------------------------------------------------
++// Modules
++// ---------------------------------------------------------------------------------------------
++
++// Retail firmware ships Piglet without its runtime GLSL compiler, so (like every other GLES
++// homebrew) a Piglet + libSceShaccVSH pair is loaded from here. The pair can also be bundled in
++// the package under /app0/assets/misc/ for a self-contained install.
++#define PS4_USER_MODULE_DIR "/data/self/system/common/lib"
++#define PS4_BUNDLED_MODULE_DIR "/app0/assets/misc"
++
++static int32_t pigletModule = -1;
++static int32_t shaccModule = -1;
++
++static int32_t ps4LoadModule(const char *path)
++{
++	int32_t startResult = 0;
++	const int32_t handle = (int32_t)sceKernelLoadStartModule(path, 0, NULL, 0, NULL, &startResult);
++	if (handle < 0) {
++		sysLogPrintf(LOG_WARNING, "PS4: sceKernelLoadStartModule(%s) failed: 0x%08x", path, (uint32_t)handle);
++	} else {
++		sysLogPrintf(LOG_NOTE, "PS4: loaded %s (handle %d, start %d)", path, handle, startResult);
++	}
++	return handle;
++}
++
++static int ps4FileExists(const char *path)
++{
++	return access(path, F_OK) == 0;
++}
++
++static int ps4LoadGraphicsModules(void)
++{
++	if (pigletModule >= 0) {
++		return 1;
++	}
++
++	char sysdir[128];
++	const char *word = sceKernelGetFsSandboxRandomWord();
++	snprintf(sysdir, sizeof(sysdir), "/%s/common/lib", word ? word : "system");
++
++	static const char *const sysmods[] = {
++		"libSceSysCore", "libSceMbus", "libSceIpmi", "libSceSystemService",
++		"libSceUserService", "libSceAudioOut", "libScePad",
++	};
++	char path[256];
++	for (size_t i = 0; i < sizeof(sysmods) / sizeof(*sysmods); ++i) {
++		snprintf(path, sizeof(path), "%s/%s.sprx", sysdir, sysmods[i]);
++		ps4LoadModule(path);
++	}
++
++	// Piglet and the shader compiler are a matched pair: both come from the same directory.
++	const char *dirs[] = { PS4_BUNDLED_MODULE_DIR, PS4_USER_MODULE_DIR };
++	const char *moddir = NULL;
++	for (size_t i = 0; i < 2 && pigletModule < 0; ++i) {
++		snprintf(path, sizeof(path), "%s/libScePigletv2VSH.sprx", dirs[i]);
++		if (ps4FileExists(path)) {
++			pigletModule = ps4LoadModule(path);
++			if (pigletModule >= 0) {
++				moddir = dirs[i];
++			}
++		}
++	}
++
++	if (pigletModule < 0) {
++		sysLogPrintf(LOG_WARNING, "PS4: no Piglet in %s, trying the system one (shaders will most likely fail to compile)",
++			PS4_USER_MODULE_DIR);
++		snprintf(path, sizeof(path), "%s/libScePigletv2VSH.sprx", sysdir);
++		pigletModule = ps4LoadModule(path);
++		moddir = sysdir;
++	}
++	if (pigletModule < 0) {
++		sysLogPrintf(LOG_ERROR, "PS4: could not load libScePigletv2VSH.sprx");
++		return 0;
++	}
++
++	snprintf(path, sizeof(path), "%s/libSceShaccVSH.sprx", moddir);
++	shaccModule = ps4LoadModule(path);
++	if (shaccModule < 0) {
++		snprintf(path, sizeof(path), "%s/libSceShaccVSH.sprx", sysdir);
++		shaccModule = ps4LoadModule(path);
++	}
++	if (shaccModule < 0) {
++		sysLogPrintf(LOG_ERROR, "PS4: could not load libSceShaccVSH.sprx (the GLSL compiler). "
++			"Copy libScePigletv2VSH.sprx and libSceShaccVSH.sprx to " PS4_USER_MODULE_DIR "/");
++	}
++
++	return 1;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Memory statistics
++// ---------------------------------------------------------------------------------------------
++
++// The OpenOrbis prototypes for these take their out parameters by value; call them through the
++// real signatures.
++typedef int32_t (*Ps4AvailDirectFn)(off_t, off_t, size_t, off_t *, size_t *);
++typedef int32_t (*Ps4AvailFlexFn)(size_t *);
++
++extern int ps4HeapGetKind(void) __attribute__((weak));
++extern void ps4HeapGetStats(size_t *arena, size_t *inuse, size_t *peak) __attribute__((weak));
++
++static size_t ps4LargestFreeDirectBlock(void)
++{
++	off_t phys = 0;
++	size_t size = 0;
++	((Ps4AvailDirectFn)(void *)sceKernelAvailableDirectMemorySize)(0, (off_t)sceKernelGetDirectMemorySize(), 0, &phys, &size);
++	return size;
++}
++
++void ps4LogMemory(const char *when)
++{
++	size_t flex = 0;
++	((Ps4AvailFlexFn)(void *)sceKernelAvailableFlexibleMemorySize)(&flex);
++
++	size_t arena = 0, inuse = 0, peak = 0;
++	int kind = 0;
++	if (ps4HeapGetStats && ps4HeapGetKind) {
++		ps4HeapGetStats(&arena, &inuse, &peak);
++		kind = ps4HeapGetKind();
++	}
++
++	sysLogPrintf(LOG_NOTE, "PS4: memory %s: heap %zu/%zu MiB (peak %zu, %s), direct total %zu MiB, "
++		"largest free direct %zu MiB, free flexible %zu MiB",
++		when, inuse >> 20, arena >> 20, peak >> 20,
++		kind == 1 ? "system flexible" : (kind == 2 ? "direct" : "no arena"),
++		(size_t)sceKernelGetDirectMemorySize() >> 20, ps4LargestFreeDirectBlock() >> 20, flex >> 20);
++}
++
++// ---------------------------------------------------------------------------------------------
++// Piglet / EGL
++// ---------------------------------------------------------------------------------------------
++
++#define PS4_VSYNC_MARKER PS4_DATA_DIR "/ps4_vsync"
++#define PS4_NOVSYNC_MARKER PS4_DATA_DIR "/ps4_novsync"
++
++struct pigletsizes {
++	uint64_t sysShared;
++	uint64_t vidShared;
++	uint64_t flexible;
++	uint32_t cmdBuf;
++	uint32_t lcueBuf;
++	uint64_t neededDirect; // only tried if this much direct memory is free in one block
++};
++
++// Tried in order until eglGetDisplay() succeeds. A "gde" app gets ~768 MiB of direct memory and
++// ~255 MiB of flexible memory. Perfect Dark needs far less than Ocarina of Time does (smaller
++// framebuffers count, ~16 MiB game heap + a 32 MiB ROM image), so the heap arena is smaller and
++// the list starts with the verified SoH configuration.
++static const struct pigletsizes pigletCandidates[] = {
++	{ 128ull << 20, 512ull << 20, 236ull << 20, 4u << 20, 4u << 20, 700ull << 20 },
++	{ 128ull << 20, 512ull << 20, 208ull << 20, 4u << 20, 4u << 20, 700ull << 20 },
++	{ 128ull << 20, 384ull << 20, 208ull << 20, 1u << 20, 1u << 20, 560ull << 20 },
++	{  64ull << 20, 128ull << 20, 208ull << 20, 1u << 20, 1u << 20, 0 },
++	{  64ull << 20, 128ull << 20, 176ull << 20, 1u << 20, 1u << 20, 0 },
++	{  64ull << 20, 128ull << 20,  64ull << 20, 1u << 20, 1u << 20, 0 },
++};
++
++static EGLDisplay eglDisp = EGL_NO_DISPLAY;
++static EGLSurface eglSurf = EGL_NO_SURFACE;
++static EGLContext eglCtx = EGL_NO_CONTEXT;
++static OrbisPglWindow pglWindow;
++static int vsyncOn = 0;
++
++// SDL_GetTicks64() + 1 while eglSwapBuffers() runs, 0 otherwise
++static volatile uint64_t swapStartedAt = 0;
++
++static void *ps4SwapWatchdog(void *arg)
++{
++	(void)arg;
++	for (;;) {
++		SDL_Delay(250);
++		const uint64_t started = swapStartedAt;
++		if (started && SDL_GetTicks64() + 1 - started > 4000) {
++			FILE *f = fopen(PS4_NOVSYNC_MARKER, "w");
++			if (f) {
++				fputs("eglSwapBuffers blocked with swap interval 1; delete this file to try vsync again\n", f);
++				fclose(f);
++			}
++			sysLogPrintf(LOG_ERROR, "PS4: eglSwapBuffers blocked for 4 s; vsync disabled for the next start, quitting");
++			sceSystemServiceLoadExec("exit", NULL);
++			_exit(0);
++		}
++	}
++	return NULL;
++}
++
++static int ps4ConfigurePiglet(int w, int h, const struct pigletsizes *sz)
++{
++	OrbisPglConfig cfg;
++	memset(&cfg, 0, sizeof(cfg));
++	cfg.size = sizeof(cfg);
++	cfg.flags = ORBIS_PGL_FLAGS_USE_COMPOSITE_EXT | ORBIS_PGL_FLAGS_USE_TILED_TEXTURE | 0x20;
++	if (sz->flexible) {
++		cfg.flags |= ORBIS_PGL_FLAGS_USE_FLEXIBLE_MEMORY;
++	}
++	cfg.processOrder = 1;
++	cfg.systemSharedMemorySize = sz->sysShared;
++	cfg.videoSharedMemorySize = sz->vidShared;
++	cfg.maxMappedFlexibleMemory = sz->flexible;
++	cfg.drawCommandBufferSize = sz->cmdBuf;
++	cfg.lcueResourceBufferSize = sz->lcueBuf;
++	cfg.dbgPosCmd_0x40 = (uint32_t)w;
++	cfg.dbgPosCmd_0x44 = (uint32_t)h;
++	cfg.dbgPosCmd_0x48 = 0;
++	cfg.dbgPosCmd_0x4C = 0;
++	cfg.unk_0x5C = 2;
++
++	sysLogPrintf(LOG_NOTE, "PS4: Piglet config: system %llu MiB, video %llu MiB, flexible %llu MiB, cmdbuf %u MiB",
++		(unsigned long long)(sz->sysShared >> 20), (unsigned long long)(sz->vidShared >> 20),
++		(unsigned long long)(sz->flexible >> 20), sz->cmdBuf >> 20);
++
++	if (!scePigletSetConfigurationVSH(&cfg)) {
++		sysLogPrintf(LOG_WARNING, "PS4: scePigletSetConfigurationVSH rejected that configuration");
++		return 0;
++	}
++	return 1;
++}
++
++static int ps4ChooseConfig(EGLConfig *config)
++{
++	static const EGLint ds[][2] = { { 24, 8 }, { 24, 0 }, { 16, 0 }, { 0, 0 } };
++	for (size_t i = 0; i < sizeof(ds) / sizeof(*ds); ++i) {
++		const EGLint attribs[] = {
++			EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
++			EGL_DEPTH_SIZE, ds[i][0], EGL_STENCIL_SIZE, ds[i][1],
++			EGL_SAMPLE_BUFFERS, 0, EGL_SAMPLES, 0,
++			EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++			EGL_NONE,
++		};
++		EGLint num = 0;
++		if (eglChooseConfig(eglDisp, attribs, config, 1, &num) && num >= 1) {
++			EGLint d = 0, s = 0;
++			eglGetConfigAttrib(eglDisp, *config, EGL_DEPTH_SIZE, &d);
++			eglGetConfigAttrib(eglDisp, *config, EGL_STENCIL_SIZE, &s);
++			sysLogPrintf(LOG_NOTE, "PS4: EGL config: asked depth %d stencil %d, got %d/%d", ds[i][0], ds[i][1], d, s);
++			return 1;
++		}
++		sysLogPrintf(LOG_WARNING, "PS4: eglChooseConfig(depth %d, stencil %d) failed: 0x%04x", ds[i][0], ds[i][1], eglGetError());
++	}
++	return 0;
++}
++
++int ps4GfxInit(int width, int height)
++{
++	if (eglCtx != EGL_NO_CONTEXT) {
++		return 0;
++	}
++
++	if (!ps4LoadGraphicsModules()) {
++		return -1;
++	}
++
++	ps4LogMemory("before Piglet");
++
++	for (size_t i = 0; i < sizeof(pigletCandidates) / sizeof(*pigletCandidates); ++i) {
++		const struct pigletsizes *sz = &pigletCandidates[i];
++		if (ps4LargestFreeDirectBlock() < sz->neededDirect) {
++			continue;
++		}
++		if (!ps4ConfigurePiglet(width, height, sz)) {
++			continue;
++		}
++		eglDisp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++		if (eglDisp != EGL_NO_DISPLAY) {
++			break;
++		}
++		sysLogPrintf(LOG_WARNING, "PS4: eglGetDisplay failed with that configuration");
++	}
++	if (eglDisp == EGL_NO_DISPLAY) {
++		sysLogPrintf(LOG_ERROR, "PS4: eglGetDisplay failed with every Piglet configuration");
++		return -1;
++	}
++
++	EGLint major = 0, minor = 0;
++	if (!eglInitialize(eglDisp, &major, &minor)) {
++		sysLogPrintf(LOG_ERROR, "PS4: eglInitialize failed: 0x%04x", eglGetError());
++		return -1;
++	}
++	sysLogPrintf(LOG_NOTE, "PS4: EGL %d.%d", major, minor);
++
++	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
++		sysLogPrintf(LOG_ERROR, "PS4: eglBindAPI failed: 0x%04x", eglGetError());
++		return -1;
++	}
++
++	// eglSwapInterval(1) after eglMakeCurrent() has been seen to block eglSwapBuffers() forever;
++	// it is only set here, before the surface exists, and only when asked for with a marker file.
++	vsyncOn = ps4FileExists(PS4_VSYNC_MARKER) && !ps4FileExists(PS4_NOVSYNC_MARKER);
++	sysLogPrintf(LOG_NOTE, "PS4: vsync %s", vsyncOn ? "on (ps4_vsync marker)" : "off, frame pacing by timer");
++	if (!eglSwapInterval(eglDisp, vsyncOn ? 1 : 0)) {
++		sysLogPrintf(LOG_WARNING, "PS4: eglSwapInterval failed: 0x%04x", eglGetError());
++	}
++	if (vsyncOn) {
++		pthread_t thr;
++		if (pthread_create(&thr, NULL, ps4SwapWatchdog, NULL) == 0) {
++			pthread_detach(thr);
++		}
++	}
++
++	EGLConfig config = NULL;
++	if (!ps4ChooseConfig(&config)) {
++		sysLogPrintf(LOG_ERROR, "PS4: no usable EGL config");
++		return -1;
++	}
++
++	memset(&pglWindow, 0, sizeof(pglWindow));
++	pglWindow.uID = 0;
++	pglWindow.uWidth = (uint32_t)width;
++	pglWindow.uHeight = (uint32_t)height;
++
++	const EGLint winAttribs[] = { EGL_RENDER_BUFFER, EGL_BACK_BUFFER, EGL_NONE };
++	eglSurf = eglCreateWindowSurface(eglDisp, config, &pglWindow, winAttribs);
++	if (eglSurf == EGL_NO_SURFACE) {
++		sysLogPrintf(LOG_ERROR, "PS4: eglCreateWindowSurface failed: 0x%04x", eglGetError());
++		return -1;
++	}
++
++	const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
++	eglCtx = eglCreateContext(eglDisp, config, EGL_NO_CONTEXT, ctxAttribs);
++	if (eglCtx == EGL_NO_CONTEXT) {
++		sysLogPrintf(LOG_ERROR, "PS4: eglCreateContext failed: 0x%04x", eglGetError());
++		return -1;
++	}
++
++	if (!eglMakeCurrent(eglDisp, eglSurf, eglSurf, eglCtx)) {
++		sysLogPrintf(LOG_ERROR, "PS4: eglMakeCurrent failed: 0x%04x", eglGetError());
++		return -1;
++	}
++
++	sysLogPrintf(LOG_NOTE, "PS4: GLES context ready (%dx%d)", width, height);
++	ps4LogMemory("after Piglet");
++
++	return 0;
++}
++
++void ps4GfxSwapBuffers(void)
++{
++	if (eglDisp != EGL_NO_DISPLAY && eglSurf != EGL_NO_SURFACE) {
++		swapStartedAt = SDL_GetTicks64() + 1;
++		eglSwapBuffers(eglDisp, eglSurf);
++		swapStartedAt = 0;
++	}
++}
++
++int ps4GfxVsyncActive(void)
++{
++	return vsyncOn;
++}
++
++void ps4GfxShutdown(void)
++{
++	if (eglDisp == EGL_NO_DISPLAY) {
++		return;
++	}
++	eglMakeCurrent(eglDisp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++	if (eglSurf != EGL_NO_SURFACE) {
++		eglDestroySurface(eglDisp, eglSurf);
++		eglSurf = EGL_NO_SURFACE;
++	}
++	if (eglCtx != EGL_NO_CONTEXT) {
++		eglDestroyContext(eglDisp, eglCtx);
++		eglCtx = EGL_NO_CONTEXT;
++	}
++	eglTerminate(eglDisp);
++	eglDisp = EGL_NO_DISPLAY;
++}
++
++void ps4HideSplashScreen(void)
++{
++	sceSystemServiceHideSplashScreen();
++}
++
++// ---------------------------------------------------------------------------------------------
++// User / pad
++// ---------------------------------------------------------------------------------------------
++
++static int userReady = 0;
++static int32_t userId = -1;
++
++int32_t ps4GetUserId(void)
++{
++	if (!userReady) {
++		struct { int32_t priority; } params = { 700 }; // SCE_KERNEL_PRIO_FIFO_DEFAULT
++		sceUserServiceInitialize(&params); // harmless if already initialized
++		if (sceUserServiceGetInitialUser(&userId) < 0) {
++			sysLogPrintf(LOG_ERROR, "PS4: sceUserServiceGetInitialUser failed");
++			userId = -1;
++		}
++		userReady = 1;
++	}
++	return userId;
++}
++
++// One slot per logged-in PS4 user (up to 4, the game's maximum). Each user's DualShock 4 is
++// exposed to SDL as its own virtual game controller while it is connected; the game's input code
++// already assigns controllers to players as they appear and disappear. Users who log in later
++// (PS button on a second controller, pick a profile) are picked up by ps4PadPoll().
++
++#define PS4_MAX_PADS 4
++#define PS4_PAD_POLL_MS 500
++
++struct ps4pad {
++	int32_t userId;
++	int32_t handle;
++	SDL_JoystickID instance;
++};
++
++static struct ps4pad pads[PS4_MAX_PADS] = {
++	{ -1, -1, -1 }, { -1, -1, -1 }, { -1, -1, -1 }, { -1, -1, -1 },
++};
++static int padInitDone = 0;
++static uint64_t padLastPoll = 0;
++
++static Sint16 ps4StickToAxis(uint8_t v)
++{
++	int s = ((int)v - 128) * 258;
++	if (s > 32767) s = 32767;
++	if (s < -32768) s = -32768;
++	return (Sint16)s;
++}
++
++static Sint16 ps4TriggerToAxis(uint8_t v)
++{
++	// The generated mapping for a virtual controller ("lefttrigger:a4") takes the full
++	// -32768..32767 range as input and rescales it to the 0..32767 trigger range.
++	return (Sint16)((int)v * 257 - 32768);
++}
++
++static void SDLCALL ps4PadUpdate(void *userdata)
++{
++	struct ps4pad *pad = (struct ps4pad *)userdata;
++	if (pad->handle < 0 || pad->instance < 0) {
++		return;
++	}
++
++	SDL_Joystick *joy = SDL_JoystickFromInstanceID(pad->instance);
++	if (!joy) {
++		return;
++	}
++
++	OrbisPadData data;
++	memset(&data, 0, sizeof(data));
++	if (scePadReadState(pad->handle, &data) < 0 || !data.connected) {
++		return;
++	}
++
++	static const struct { SDL_GameControllerButton sdl; uint32_t orbis; } map[] = {
++		{ SDL_CONTROLLER_BUTTON_A,             ORBIS_PAD_BUTTON_CROSS },
++		{ SDL_CONTROLLER_BUTTON_B,             ORBIS_PAD_BUTTON_CIRCLE },
++		{ SDL_CONTROLLER_BUTTON_X,             ORBIS_PAD_BUTTON_SQUARE },
++		{ SDL_CONTROLLER_BUTTON_Y,             ORBIS_PAD_BUTTON_TRIANGLE },
++		// SHARE belongs to the system; the touch pad click stands in for BACK.
++		{ SDL_CONTROLLER_BUTTON_BACK,          ORBIS_PAD_BUTTON_TOUCH_PAD },
++		{ SDL_CONTROLLER_BUTTON_START,         ORBIS_PAD_BUTTON_OPTIONS },
++		{ SDL_CONTROLLER_BUTTON_LEFTSTICK,     ORBIS_PAD_BUTTON_L3 },
++		{ SDL_CONTROLLER_BUTTON_RIGHTSTICK,    ORBIS_PAD_BUTTON_R3 },
++		{ SDL_CONTROLLER_BUTTON_LEFTSHOULDER,  ORBIS_PAD_BUTTON_L1 },
++		{ SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, ORBIS_PAD_BUTTON_R1 },
++		{ SDL_CONTROLLER_BUTTON_DPAD_UP,       ORBIS_PAD_BUTTON_UP },
++		{ SDL_CONTROLLER_BUTTON_DPAD_DOWN,     ORBIS_PAD_BUTTON_DOWN },
++		{ SDL_CONTROLLER_BUTTON_DPAD_LEFT,     ORBIS_PAD_BUTTON_LEFT },
++		{ SDL_CONTROLLER_BUTTON_DPAD_RIGHT,    ORBIS_PAD_BUTTON_RIGHT },
++	};
++	for (size_t i = 0; i < sizeof(map) / sizeof(*map); ++i) {
++		SDL_JoystickSetVirtualButton(joy, map[i].sdl, (data.buttons & map[i].orbis) ? SDL_PRESSED : SDL_RELEASED);
++	}
++
++	SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_LEFTX, ps4StickToAxis(data.leftStick.x));
++	SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_LEFTY, ps4StickToAxis(data.leftStick.y));
++	SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_RIGHTX, ps4StickToAxis(data.rightStick.x));
++	SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_RIGHTY, ps4StickToAxis(data.rightStick.y));
++	SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_TRIGGERLEFT, ps4TriggerToAxis(data.analogButtons.l2));
++	SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, ps4TriggerToAxis(data.analogButtons.r2));
++}
++
++static int SDLCALL ps4PadRumble(void *userdata, Uint16 lo, Uint16 hi)
++{
++	struct ps4pad *pad = (struct ps4pad *)userdata;
++	if (pad->handle < 0) {
++		return -1;
++	}
++	OrbisPadVibeParam vib;
++	vib.lgMotor = (uint8_t)(lo >> 8);
++	vib.smMotor = (uint8_t)(hi >> 8);
++	return scePadSetVibration(pad->handle, &vib) < 0 ? -1 : 0;
++}
++
++static int SDLCALL ps4PadSetLED(void *userdata, Uint8 r, Uint8 g, Uint8 b)
++{
++	struct ps4pad *pad = (struct ps4pad *)userdata;
++	if (pad->handle < 0) {
++		return -1;
++	}
++	OrbisPadColor c = { r, g, b, 255 };
++	return scePadSetLightBar(pad->handle, &c) < 0 ? -1 : 0;
++}
++
++static void ps4PadAttachVirtual(struct ps4pad *pad)
++{
++	SDL_VirtualJoystickDesc desc;
++	SDL_zero(desc);
++	desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
++	desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
++	desc.naxes = SDL_CONTROLLER_AXIS_MAX;
++	desc.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
++	desc.nhats = 0;
++	desc.vendor_id = 0x054C;  // Sony
++	desc.product_id = 0x09CC; // DualShock 4 (v2): lets SDL report it as a PS4 controller
++	desc.name = "PS4 Controller";
++	desc.userdata = pad;
++	desc.Update = ps4PadUpdate;
++	desc.Rumble = ps4PadRumble;
++	desc.SetLED = ps4PadSetLED;
++
++	const int idx = SDL_JoystickAttachVirtualEx(&desc);
++	if (idx < 0) {
++		sysLogPrintf(LOG_ERROR, "PS4: SDL_JoystickAttachVirtualEx failed: %s", SDL_GetError());
++		return;
++	}
++	pad->instance = SDL_JoystickGetDeviceInstanceID(idx);
++	sysLogPrintf(LOG_NOTE, "PS4: controller of user 0x%08x connected (pad %d, SDL instance %d)",
++		(uint32_t)pad->userId, (int)(pad - pads), (int)pad->instance);
++}
++
++static void ps4PadDetachVirtual(struct ps4pad *pad)
++{
++	if (pad->instance < 0) {
++		return;
++	}
++	const int n = SDL_NumJoysticks();
++	for (int i = 0; i < n; ++i) {
++		if (SDL_JoystickGetDeviceInstanceID(i) == pad->instance) {
++			SDL_JoystickDetachVirtual(i);
++			break;
++		}
++	}
++	sysLogPrintf(LOG_NOTE, "PS4: controller of user 0x%08x disconnected (pad %d)", (uint32_t)pad->userId, (int)(pad - pads));
++	pad->instance = -1;
++}
++
++static void ps4PadClose(struct ps4pad *pad)
++{
++	ps4PadDetachVirtual(pad);
++	if (pad->handle >= 0) {
++		scePadClose(pad->handle);
++	}
++	sysLogPrintf(LOG_NOTE, "PS4: user 0x%08x logged out (pad %d)", (uint32_t)pad->userId, (int)(pad - pads));
++	pad->handle = -1;
++	pad->userId = -1;
++}
++
++static void ps4PadOpen(struct ps4pad *pad, int32_t uid)
++{
++	int32_t handle = scePadOpen(uid, ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
++	if (handle < 0) {
++		handle = scePadGetHandle(uid, ORBIS_PAD_PORT_TYPE_STANDARD, 0);
++	}
++	if (handle < 0) {
++		sysLogPrintf(LOG_WARNING, "PS4: scePadOpen for user 0x%08x failed: 0x%08x", (uint32_t)uid, (uint32_t)handle);
++		return;
++	}
++	pad->userId = uid;
++	pad->handle = handle;
++	pad->instance = -1;
++	sysLogPrintf(LOG_NOTE, "PS4: opened the controller of user 0x%08x (pad %d, handle %d)", (uint32_t)uid, (int)(pad - pads), handle);
++}
++
++static void ps4PadRefresh(void)
++{
++	// logged-in users, the initial user first so they stay player 1
++	int32_t users[PS4_MAX_PADS];
++	int nusers = 0;
++	const int32_t initial = ps4GetUserId();
++	if (initial >= 0) {
++		users[nusers++] = initial;
++	}
++
++	OrbisUserServiceLoginUserIdList list;
++	memset(&list, 0xff, sizeof(list));
++	if (sceUserServiceGetLoginUserIdList(&list) >= 0) {
++		for (int i = 0; i < ORBIS_USER_SERVICE_MAX_LOGIN_USERS && nusers < PS4_MAX_PADS; ++i) {
++			const int32_t uid = list.userId[i];
++			if (uid == ORBIS_USER_SERVICE_USER_ID_INVALID || uid == initial) {
++				continue;
++			}
++			users[nusers++] = uid;
++		}
++	}
++
++	// users who logged out
++	for (int p = 0; p < PS4_MAX_PADS; ++p) {
++		if (pads[p].userId < 0) {
++			continue;
++		}
++		int found = 0;
++		for (int u = 0; u < nusers; ++u) {
++			found |= users[u] == pads[p].userId;
++		}
++		if (!found) {
++			ps4PadClose(&pads[p]);
++		}
++	}
++
++	// users who logged in
++	for (int u = 0; u < nusers; ++u) {
++		int have = 0;
++		for (int p = 0; p < PS4_MAX_PADS; ++p) {
++			have |= pads[p].userId == users[u];
++		}
++		for (int p = 0; p < PS4_MAX_PADS && !have; ++p) {
++			if (pads[p].userId < 0) {
++				ps4PadOpen(&pads[p], users[u]);
++				have = 1;
++			}
++		}
++	}
++
++	// controllers switched on or off (a logged-in user can be without a controller)
++	for (int p = 0; p < PS4_MAX_PADS; ++p) {
++		if (pads[p].handle < 0) {
++			continue;
++		}
++		OrbisPadData data;
++		memset(&data, 0, sizeof(data));
++		const int connected = scePadReadState(pads[p].handle, &data) >= 0 && data.connected;
++		if (connected && pads[p].instance < 0) {
++			ps4PadAttachVirtual(&pads[p]);
++		} else if (!connected && pads[p].instance >= 0) {
++			ps4PadDetachVirtual(&pads[p]);
++		}
++	}
++}
++
++void ps4PadAttach(void)
++{
++	if (padInitDone) {
++		return;
++	}
++	padInitDone = 1;
++
++	// The dummy video driver never gives the window focus, and SDL drops joystick input of
++	// unfocused applications unless told otherwise.
++	SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1", SDL_HINT_OVERRIDE);
++
++	const int32_t ret = scePadInit();
++	if (ret < 0) {
++		sysLogPrintf(LOG_WARNING, "PS4: scePadInit returned 0x%08x", (uint32_t)ret);
++	}
++
++	ps4PadRefresh();
++	padLastPoll = SDL_GetTicks64();
++}
++
++void ps4PadPoll(void)
++{
++	if (!padInitDone) {
++		return;
++	}
++	const uint64_t now = SDL_GetTicks64();
++	if (now - padLastPoll >= PS4_PAD_POLL_MS) {
++		padLastPoll = now;
++		ps4PadRefresh();
++	}
++}
++
++#endif // PLATFORM_PS4
+diff --git a/port/src/system.c b/port/src/system.c
+index 0f0cdc2..3e4e4e6 100644
+--- a/port/src/system.c
++++ b/port/src/system.c
+@@ -12,6 +12,9 @@
+ #include <SDL.h>
+ #include <PR/ultratypes.h>
+ #include "platform.h"
++#ifdef PLATFORM_PS4
++#include "ps4platform.h"
++#endif
+ #include "system.h"
+ 
+ #ifdef PLATFORM_WIN32
+@@ -216,6 +219,11 @@ void sysFatalError(const char *fmt, ...)
+ 
+ void sysGetExecutablePath(char *outPath, const u32 outLen)
+ {
++#ifdef PLATFORM_PS4
++	// the package is mounted read-only here
++	snprintf(outPath, outLen, "/app0");
++	return;
++#endif
+ 	// try asking SDL
+ 	char *sdlPath = SDL_GetBasePath();
+ 
+@@ -250,6 +258,10 @@ void sysGetExecutablePath(char *outPath, const u32 outLen)
+ 
+ void sysGetHomePath(char *outPath, const u32 outLen)
+ {
++#ifdef PLATFORM_PS4
++	snprintf(outPath, outLen, PS4_DATA_DIR);
++	return;
++#endif
+ 	// try asking SDL
+ 	char *sdlPath = SDL_GetPrefPath("", "perfectdark");
+ 
+diff --git a/port/src/video.c b/port/src/video.c
+index 8bc3e91..9272604 100644
+--- a/port/src/video.c
++++ b/port/src/video.c
+@@ -10,10 +10,20 @@
+ #include "video.h"
+ 
+ #include "../fast3d/gfx_api.h"
++#ifdef PLATFORM_PS4
++#include "../fast3d/gfx_ps4.h"
++#include "../fast3d/gfx_gles2.h"
++#else
+ #include "../fast3d/gfx_sdl.h"
+ #include "../fast3d/gfx_opengl.h"
++#endif
+ 
+-#ifdef PLATFORM_NSWITCH
++#ifdef PLATFORM_PS4
++#define DEFAULT_VID_WIDTH 1920
++#define DEFAULT_VID_HEIGHT 1080
++#define DEFAULT_VID_FULLSCREEN true
++#define DEFAULT_VID_FULLSCREEN_EXCLUSIVE true
++#elif defined(PLATFORM_NSWITCH)
+ #define DEFAULT_VID_WIDTH 1280
+ #define DEFAULT_VID_HEIGHT 720
+ #define DEFAULT_VID_FULLSCREEN true
+@@ -38,9 +48,17 @@ static s32 vidFullscreenExclusive = DEFAULT_VID_FULLSCREEN_EXCLUSIVE;
+ static s32 vidMaximize = false;
+ static s32 vidCenter = false;
+ static s32 vidAllowHiDpi = false;
++#ifdef PLATFORM_PS4
++// vsync can only be chosen when the EGL surface is created (ps4_vsync marker file), so frames
++// are paced by the window backend's timer instead
++static s32 vidVsync = 0;
++static s32 vidMSAA = 1;
++static s32 vidFramerateLimit = 60;
++#else
+ static s32 vidVsync = 1;
+ static s32 vidMSAA = 1;
+ static s32 vidFramerateLimit = 0;
++#endif
+ 
+ static s32 vidDisplayFPS = 0;
+ static f32 vidDisplayFPSInterval = 1.f;
+@@ -71,8 +89,15 @@ void optionsMenuInit();
+ 
+ s32 videoInit(void)
+ {
++#ifdef PLATFORM_PS4
++	wmAPI = &gfx_ps4;
++	renderingAPI = &gfx_gles2_api;
++	vidMSAA = 1; // GLES2 has no multisampled render targets
++	vidFramebuffers = true; // the game always renders offscreen here
++#else
+ 	wmAPI = &gfx_sdl;
+ 	renderingAPI = &gfx_opengl_api;
++#endif
+ 
+ 	gfx_current_native_viewport.width = 320;
+ 	gfx_current_native_viewport.height = 220;
+diff --git a/ps4/.gitattributes b/ps4/.gitattributes
+new file mode 100644
+index 0000000..2716a5c
+--- /dev/null
++++ b/ps4/.gitattributes
+@@ -0,0 +1,4 @@
++*.sh text eol=lf
++*.patch text eol=lf
++*.cmake text eol=lf
++*.py text eol=lf
+diff --git a/ps4/README.md b/ps4/README.md
+new file mode 100644
+index 0000000..36b442b
+--- /dev/null
++++ b/ps4/README.md
+@@ -0,0 +1,146 @@
++# Perfect Dark for PS4
++
++An experimental native port of the [Perfect Dark PC port](https://github.com/perfect-dark-pc-port/perfect_dark)
++(itself built on the [n64decomp decompilation](https://github.com/n64decomp/perfect_dark)) to jailbroken
++PS4 consoles, built with the [OpenOrbis toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain).
++It renders through Piglet, the PS4's OpenGL ES 2.0 implementation. It is not an emulator.
++
++The structure and most of the platform knowledge come from
++[alechurri/shipofharkinian-ps4](https://github.com/alechurri/shipofharkinian-ps4); see
++[docs/TECHNICAL.md](docs/TECHNICAL.md).
++
++**No game data and no Sony binaries are included.** You need your own Perfect Dark ROM and the two
++Piglet modules dumped from your own console.
++
++Everything lives in one folder: the `perfect_dark` repository, with this `ps4/` folder in it. The
++whole thing is distributed as a single patch file, `perfect_dark-ps4.patch`.
++
++## Building
++
++Linux (tested on Ubuntu 24.04) or WSL; Git Bash on Windows also works. Requirements: LLVM 18
++(`clang`, `clang++`, `ld.lld`, `llvm-ar`), CMake 3.16+, Ninja, Git, Python 3, curl, and for
++`package.sh` OpenSSL 1.1 (`PkgTool.Core` is a .NET Core 3 program; on Ubuntu 24 install
++`libssl1.1` from the focal archive).
++
++First time:
++
++```sh
++git clone https://github.com/perfect-dark-pc-port/perfect_dark
++cd perfect_dark
++git config core.autocrlf false
++git checkout 32a1cb9f268dd3ac73016801025c6bbbfa20130f
++tr -d '\r' < /path/to/perfect_dark-ps4.patch > /tmp/pd-ps4.patch && git apply /tmp/pd-ps4.patch
++
++ps4/setup.sh        # downloads OpenOrbis v0.5.4 to ps4/tools/
++ps4/build-deps.sh   # cross-builds zlib and SDL2 into ps4/prefix/
++ps4/build.sh        # -> build/ps4/pd.x86_64.elf   (ROMID=pal-final / jpn-final for other regions)
++ps4/package.sh      # -> ps4/out/IV0000-PDRK00001_00-PERFECTDARKPORT0.pkg
++```
++
++## Updating
++
++A new version always comes as a complete `perfect_dark-ps4.patch`. From the `perfect_dark` folder:
++
++```sh
++ps4/update.sh /path/to/perfect_dark-ps4.patch
++ps4/build.sh && ps4/package.sh
++```
++
++`update.sh` resets the game code to the upstream commit and applies the new patch. The toolchain
++(`ps4/tools`), the dependencies (`ps4/prefix`, `ps4/deps`), your images (`ps4/custom`), finished
++packages (`ps4/out`) and the build folder (`build/`) are kept. Changes of your own to the game
++code or to the scripts are not.
++
++Then uninstall the game on the PS4 before installing the new package: an install over the top
++with the same version number may silently keep the old one.
++
++## Installing
++
++1. Dump `libScePigletv2VSH.sprx` and `libSceShaccVSH.sprx` (Piglet with its runtime shader
++   compiler) and copy them over FTP to `/data/self/system/common/lib/`. Retail Piglet has no shader
++   compiler; the same files work for the SoH and Super Mario 64 PS4 ports.
++2. Copy your ROM to `/data/perfectdark/pd.ntsc-final.z64`
++   (md5 `e03b088b6ac9e0080440efed07c1e40f`). Optionally `pd.gbc` next to it for the Transfer Pak
++   cheats. A ROM in the older location `/data/perfectdark/data/` is still found.
++3. Install the `.pkg` with GoldHEN's package installer and start it.
++
++Config (`pd.ini`), saves and logs are written to `/data/perfectdark/` as well.
++
++## Package images
++
++The images the PS4 shows for the game. Put your own in `ps4/custom/sce_sys/` (create the folder);
++anything not there comes from the defaults in `ps4/pkg-static/sce_sys/`. Run `ps4/package.sh` again
++afterwards.
++
++| File | Size | Shown |
++| --- | --- | --- |
++| `icon0.png` | 512×512 | Home screen icon |
++| `pic1.png` | 1920×1080 | Launch splash: from the moment the game is started until its first frame |
++| `pic0.png` | 1920×1080 | Home screen background when the game is selected (optional) |
++
++All must be 24-bit RGB PNGs without transparency; `package.sh` says which file it uses and warns
++if the size or format is wrong. The PS4 caches these images: uninstall the game before installing
++a package with changed images (saves in `/data/perfectdark` are kept).
++
++## Multiplayer
++
++Up to four players, one DualShock 4 each. Every controller has to belong to a logged-in PS4
++user: switch on the second controller, press its PS button and pick a profile (a guest user is
++fine). The game picks it up within half a second, also in the middle of a session, and assigns
++it to the next free player slot. Controllers that are switched off or whose user logs out are
++released again. The first player is always the user who started the game.
++
++## Controls
++
++The DualShock 4 appears to the game as a standard controller, so the port's default Xbox-style
++layout applies and everything can be rebound in `pd.ini`.
++
++| DualShock 4 | Action |
++| --- | --- |
++| R2 | Fire / accept |
++| L2 | Aim mode |
++| Cross | Use / accept |
++| Circle | Previous weapon |
++| Square | Reload |
++| Triangle | Next weapon |
++| L1 | Radial menu |
++| R1 | Alt-fire mode |
++| L3 | Crouch cycle |
++| OPTIONS | Start / pause |
++| Touchpad click | Back |
++
++## Debugging
++
++- `/data/perfectdark/ps4_boot.log`: stdout/stderr from the very first instruction, including
++  Piglet's own `[PIG]` messages and a line if the game crashes with a signal.
++- `/data/perfectdark/pd.log`: the game's log, including the GLES capabilities found at startup
++  (extensions, attribute/varying limits) and the memory layout.
++- Vsync is off by default (frames are paced by a timer at 60 fps). An empty file
++  `/data/perfectdark/ps4_vsync` turns it on; if `eglSwapBuffers` hangs with it, a watchdog quits and
++  writes `ps4_novsync` so the next start goes back to the timer.
++
++## Layout
++
++| Path | Contents |
++| --- | --- |
++| `ps4/setup.sh`, `build-deps.sh`, `build.sh`, `package.sh`, `update.sh`, `env.sh` | Setup, build, packaging, updating |
++| `ps4/cmake/` | CMake toolchain and platform files for OpenOrbis + LLVM 18 |
++| `ps4/compat/` | Header fix-ups force-included into every file (the `struct stat` layout bug) |
++| `ps4/zlib-cmake/` | Static zlib build for `build-deps.sh` |
++| `ps4/pkg-static/` | Default package images |
++| `ps4/tests/shadertest/` | Host-side GLSL ES 1.00 validation of the generated shaders |
++| `port/src/ps4/`, `port/fast3d/gfx_ps4.cpp`, `gfx_gles2.cpp` | The PS4 code in the game |
++| `ps4/tools/`, `prefix/`, `deps/`, `custom/`, `out/` and `build/` | Local, never touched by `update.sh` |
++
++## Credits
++
++fgsfds and contributors for the Perfect Dark port, the n64decomp team for the decompilation,
++alechurri for the Ship of Harkinian PS4 port and its write-up, OsirizX for the Super Mario 64 PS4
++port, flat_z and the orbisdev contributors for the Piglet research, and the OpenOrbis team.
++
++## License
++
++The scripts, CMake files, tests and documentation in this repository are MIT licensed (the toolchain
++file, `compat/` and `zlib-cmake/` are adapted from shipofharkinian-ps4, also MIT). The patch modifies
++the Perfect Dark port and is subject to its license. Not affiliated with or endorsed by Nintendo, Rare,
++Microsoft or Sony.
+diff --git a/ps4/build-deps.sh b/ps4/build-deps.sh
+new file mode 100755
+index 0000000..5e1ad30
+--- /dev/null
++++ b/ps4/build-deps.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++# Cross-builds the two third-party dependencies of the Perfect Dark port (zlib, SDL2) into
++# ps4/prefix. SDL2 is only used for events, timing, threads and the game controller
++# API (with a virtual joystick fed from scePad); video goes through Piglet, audio through
++# sceAudioOut.
++set -e
++HERE="$(cd "$(dirname "$0")" && pwd)"
++source "$HERE/env.sh"
++SRC="$HERE/deps/src"; BLD="$HERE/deps/build"; PREFIX="$PS4_PREFIX"
++TC="$HERE/cmake/ps4-toolchain.cmake"
++mkdir -p "$SRC" "$BLD" "$PREFIX"
++
++fetch() { # name url tag
++    if [ ! -d "$SRC/$1" ]; then
++        git -c advice.detachedHead=false clone -q --depth 1 --branch "$3" "$2" "$SRC/$1"
++    fi
++}
++build() { # name srcdir [cmake args...]
++    local name="$1" src="$2"; shift 2
++    if [ -f "$BLD/$name/.done" ]; then echo "== $name (cached)"; return; fi
++    echo "== $name"
++    cmake -G Ninja -S "$(_W "$src")" -B "$(_W "$BLD/$name")" -DCMAKE_TOOLCHAIN_FILE="$(_W "$TC")" \
++        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$(_W "$PREFIX")" -DBUILD_SHARED_LIBS=OFF \
++        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "$@" > "$BLD/$name.configure.log" 2>&1 \
++        || { tail -40 "$BLD/$name.configure.log"; exit 1; }
++    cmake --build "$(_W "$BLD/$name")" > "$BLD/$name.build.log" 2>&1 || { tail -60 "$BLD/$name.build.log"; exit 1; }
++    cmake --install "$(_W "$BLD/$name")" > "$BLD/$name.install.log" 2>&1 || { tail -40 "$BLD/$name.install.log"; exit 1; }
++    touch "$BLD/$name/.done"
++}
++
++fetch zlib https://github.com/madler/zlib.git v1.3.1
++build zlib "$HERE/zlib-cmake" -DZLIB_SRC="$(_W "$SRC/zlib")"
++
++fetch SDL https://github.com/libsdl-org/SDL.git release-2.30.9
++build SDL "$SRC/SDL" -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF -DSDL2_DISABLE_SDL2MAIN=ON \
++    -DSDL2_DISABLE_INSTALL=OFF -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_OPENGL=OFF -DSDL_OPENGLES=OFF \
++    -DSDL_VULKAN=OFF -DSDL_KMSDRM=OFF -DSDL_RPI=OFF -DSDL_ALSA=OFF -DSDL_PULSEAUDIO=OFF -DSDL_PIPEWIRE=OFF \
++    -DSDL_JACK=OFF -DSDL_SNDIO=OFF -DSDL_OSS=OFF -DSDL_ESD=OFF -DSDL_ARTS=OFF -DSDL_NAS=OFF \
++    -DSDL_FUSIONSOUND=OFF -DSDL_LIBSAMPLERATE=OFF -DSDL_DBUS=OFF -DSDL_IBUS=OFF -DSDL_FCITX=OFF \
++    -DSDL_LIBUDEV=OFF -DSDL_HIDAPI_LIBUSB=OFF -DSDL_RPATH=OFF -DSDL_DUMMYVIDEO=ON -DSDL_DUMMYAUDIO=ON \
++    -DSDL_DISKAUDIO=OFF -DSDL_OFFSCREEN=OFF -DSDL_LOADSO=OFF -DSDL_DIRECTFB=OFF -DSDL_SYSTEM_ICONV=OFF \
++    -DSDL_LIBICONV=OFF -DSDL_CCACHE=OFF -DSDL_FILESYSTEM=OFF -DSDL_VIRTUAL_JOYSTICK=ON -DSDL_HIDAPI=ON \
++    -DSDL_HIDAPI_JOYSTICK=OFF -DSDL_WERROR=OFF
++
++echo "ALL DEPS OK"
+diff --git a/ps4/build.sh b/ps4/build.sh
+new file mode 100755
+index 0000000..73bd2c5
+--- /dev/null
++++ b/ps4/build.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++# Configures and builds build/ps4/pd.x86_64.elf.  ROMID=ntsc-final (default), pal-final, jpn-final
++set -e
++HERE="$(cd "$(dirname "$0")" && pwd)"
++source "$HERE/env.sh"
++ROMID="${ROMID:-ntsc-final}"
++BUILD="$PS4_BUILD_ROOT/ps4"
++[ "$ROMID" = ntsc-final ] || BUILD="$PS4_BUILD_ROOT/ps4-$ROMID"
++cmake -G Ninja -S "$(_W "$PD_GAME_DIR")" -B "$(_W "$BUILD")" \
++    -DCMAKE_TOOLCHAIN_FILE="$(_W "$HERE/cmake/ps4-toolchain.cmake")" \
++    -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}" -DROMID="$ROMID"
++cmake --build "$(_W "$BUILD")"
++ls -la "$BUILD"/*.elf
+diff --git a/ps4/cmake/Platform/PS4.cmake b/ps4/cmake/Platform/PS4.cmake
+new file mode 100644
+index 0000000..cda26f4
+--- /dev/null
++++ b/ps4/cmake/Platform/PS4.cmake
+@@ -0,0 +1,14 @@
++# Minimal CMake platform description for PS4 (OpenOrbis). Static linking only.
++set(UNIX 1)
++set(PS4 1)
++set(CMAKE_STATIC_LIBRARY_PREFIX "lib")
++set(CMAKE_STATIC_LIBRARY_SUFFIX ".a")
++set(CMAKE_FIND_LIBRARY_PREFIXES "lib")
++set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
++set(CMAKE_DL_LIBS "")
++set_property(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS FALSE)
++
++# Mandatory flags go into the compile rules so that projects resetting CMAKE_<LANG>_FLAGS keep working.
++set(CMAKE_C_COMPILE_OBJECT "<CMAKE_C_COMPILER> <DEFINES> <INCLUDES> ${PS4_C_MANDATORY_FLAGS} <FLAGS> -o <OBJECT> -c <SOURCE>")
++set(CMAKE_CXX_COMPILE_OBJECT "<CMAKE_CXX_COMPILER> <DEFINES> <INCLUDES> ${PS4_CXX_MANDATORY_FLAGS} <FLAGS> -o <OBJECT> -c <SOURCE>")
++set(CMAKE_ASM_COMPILE_OBJECT "<CMAKE_ASM_COMPILER> <DEFINES> <INCLUDES> ${PS4_C_MANDATORY_FLAGS} <FLAGS> -o <OBJECT> -c <SOURCE>")
+diff --git a/ps4/cmake/ps4-toolchain.cmake b/ps4/cmake/ps4-toolchain.cmake
+new file mode 100644
+index 0000000..d71c7a7
+--- /dev/null
++++ b/ps4/cmake/ps4-toolchain.cmake
+@@ -0,0 +1,118 @@
++# CMake toolchain for building the Perfect Dark port as PS4 homebrew with the OpenOrbis
++# toolchain and a stock LLVM 18 (clang + ld.lld).
++#
++#   cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=<this file> ...
++#
++# Adapted from alechurri/shipofharkinian-ps4 (MIT). Paths default to the layout created by
++# env.sh; override with -DOO_PS4_TOOLCHAIN=... / -DPS4_LLVM_BIN=... / -DPS4_PREFIX=... or the
++# matching environment variables.
++
++set(CMAKE_SYSTEM_NAME PS4)
++set(CMAKE_SYSTEM_PROCESSOR x86_64)
++set(CMAKE_CROSSCOMPILING TRUE)
++set(PS4 TRUE)
++
++# perfect_dark/ps4/cmake/.. = the ps4 folder; tools are downloaded to ps4/tools by setup.sh
++get_filename_component(PD_PS4_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
++set(_PS4_TOOLS "${PD_PS4_ROOT}/tools")
++
++if(NOT OO_PS4_TOOLCHAIN)
++    if(DEFINED ENV{OO_PS4_TOOLCHAIN})
++        file(TO_CMAKE_PATH "$ENV{OO_PS4_TOOLCHAIN}" OO_PS4_TOOLCHAIN)
++    else()
++        set(OO_PS4_TOOLCHAIN "${_PS4_TOOLS}/OpenOrbis/PS4Toolchain")
++    endif()
++endif()
++if(NOT PS4_LLVM_BIN)
++    if(DEFINED ENV{PS4_LLVM_BIN})
++        file(TO_CMAKE_PATH "$ENV{PS4_LLVM_BIN}" PS4_LLVM_BIN)
++    elseif(EXISTS "${_PS4_TOOLS}/llvm/bin")
++        set(PS4_LLVM_BIN "${_PS4_TOOLS}/llvm/bin")
++    else()
++        set(PS4_LLVM_BIN "/usr/bin")
++    endif()
++endif()
++if(NOT PS4_PREFIX)
++    if(DEFINED ENV{PS4_PREFIX})
++        file(TO_CMAKE_PATH "$ENV{PS4_PREFIX}" PS4_PREFIX)
++    else()
++        set(PS4_PREFIX "${PD_PS4_ROOT}/prefix")
++    endif()
++endif()
++set(OO_PS4_TOOLCHAIN "${OO_PS4_TOOLCHAIN}" CACHE PATH "OpenOrbis toolchain root")
++set(PS4_LLVM_BIN "${PS4_LLVM_BIN}" CACHE PATH "LLVM bin directory")
++set(PS4_PREFIX "${PS4_PREFIX}" CACHE PATH "Install prefix of the cross-built dependencies")
++
++# try_compile() re-reads this file in a fresh scope: forward what it needs.
++list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES OO_PS4_TOOLCHAIN PS4_LLVM_BIN PS4_PREFIX)
++
++if(CMAKE_HOST_WIN32)
++    set(_EXE ".exe")
++else()
++    set(_EXE "")
++endif()
++
++set(CMAKE_C_COMPILER "${PS4_LLVM_BIN}/clang${_EXE}")
++set(CMAKE_CXX_COMPILER "${PS4_LLVM_BIN}/clang++${_EXE}")
++set(CMAKE_ASM_COMPILER "${PS4_LLVM_BIN}/clang${_EXE}")
++set(CMAKE_AR "${PS4_LLVM_BIN}/llvm-ar${_EXE}" CACHE FILEPATH "")
++set(CMAKE_RANLIB "${PS4_LLVM_BIN}/llvm-ranlib${_EXE}" CACHE FILEPATH "")
++set(CMAKE_NM "${PS4_LLVM_BIN}/llvm-nm${_EXE}" CACHE FILEPATH "")
++set(CMAKE_STRIP "${PS4_LLVM_BIN}/llvm-strip${_EXE}" CACHE FILEPATH "")
++set(CMAKE_OBJCOPY "${PS4_LLVM_BIN}/llvm-objcopy${_EXE}" CACHE FILEPATH "")
++set(PS4_LINKER "${PS4_LLVM_BIN}/ld.lld${_EXE}")
++
++set(_PS4_TARGET x86_64-pc-freebsd12-elf)
++set(CMAKE_C_COMPILER_TARGET ${_PS4_TARGET})
++set(CMAKE_CXX_COMPILER_TARGET ${_PS4_TARGET})
++set(CMAKE_ASM_COMPILER_TARGET ${_PS4_TARGET})
++
++# Flags every translation unit needs. They are injected through the compile rules (see
++# Platform/PS4.cmake) instead of CMAKE_<LANG>_FLAGS because third-party projects overwrite
++# CMAKE_CXX_FLAGS wholesale.
++#  - libc++ headers have to come before the C headers (they wrap them with #include_next).
++#  - our own builds (SDL2 2.30, zlib) must win over the old copies bundled with OpenOrbis.
++#  - ps4_fixups.h fixes the struct stat layout of the OpenOrbis headers and must be seen before
++#    any system header, hence -include.
++set(_PS4_COMMON "-fPIC -funwind-tables -D__PS4__ -D__ORBIS__ -D_BSD_SOURCE -D_GNU_SOURCE -isysroot \"${OO_PS4_TOOLCHAIN}\"")
++set(_PS4_COMPAT "-isystem \"${PD_PS4_ROOT}/compat/include\" -include \"${PD_PS4_ROOT}/compat/include/ps4_fixups.h\"")
++set(_PS4_PREFIX_INC "-isystem \"${PS4_PREFIX}/include\"")
++set(PS4_C_MANDATORY_FLAGS "${_PS4_COMMON} ${_PS4_PREFIX_INC} -isystem \"${OO_PS4_TOOLCHAIN}/include\" ${_PS4_COMPAT}")
++set(PS4_CXX_MANDATORY_FLAGS "${_PS4_COMMON} -nostdinc++ -isystem \"${OO_PS4_TOOLCHAIN}/include/c++/v1\" ${_PS4_PREFIX_INC} -isystem \"${OO_PS4_TOOLCHAIN}/include\" ${_PS4_COMPAT} -fexceptions -fcxx-exceptions")
++
++set(CMAKE_C_FLAGS_DEBUG_INIT "-g -O0")
++set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -O0")
++set(CMAKE_C_FLAGS_RELEASE_INIT "-O2 -DNDEBUG")
++set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O2 -DNDEBUG")
++
++# System libraries every executable gets; SCE stub libraries through PS4_SCE_LIBS.
++set(PS4_BASE_LIBS "-lc++ -lc++abi -lunwind -lc -lkernel -lclang_rt.builtins-x86_64")
++set(PS4_SCE_LIBS "-lSceSysmodule -lSceSystemService -lSceUserService -lScePad -lSceAudioOut -lSceVideoOut -lScePigletv2VSH -lSceRtc"
++    CACHE STRING "SCE stub libraries linked into executables")
++
++set(_PS4_LINK "\"${PS4_LINKER}\" -m elf_x86_64 -pie --script \"${OO_PS4_TOOLCHAIN}/link.x\" --eh-frame-hdr -o <TARGET> \"${OO_PS4_TOOLCHAIN}/lib/crt1.o\" <OBJECTS> <LINK_FLAGS> -L\"${PS4_PREFIX}/lib\" -L\"${OO_PS4_TOOLCHAIN}/lib\" --start-group <LINK_LIBRARIES> ${PS4_BASE_LIBS} --end-group ${PS4_SCE_LIBS}")
++set(CMAKE_C_LINK_EXECUTABLE "${_PS4_LINK}")
++set(CMAKE_CXX_LINK_EXECUTABLE "${_PS4_LINK}")
++
++set(CMAKE_EXECUTABLE_SUFFIX ".elf")
++set(CMAKE_EXECUTABLE_SUFFIX_C ".elf")
++set(CMAKE_EXECUTABLE_SUFFIX_CXX ".elf")
++set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
++set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++
++set(CMAKE_FIND_ROOT_PATH "${PS4_PREFIX}" "${OO_PS4_TOOLCHAIN}")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
++list(APPEND CMAKE_PREFIX_PATH "${PS4_PREFIX}")
++set(CMAKE_INSTALL_PREFIX "${PS4_PREFIX}" CACHE PATH "")
++
++# Platform/PS4.cmake lives next to this file.
++list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
++
++set(THREADS_PREFER_PTHREAD_FLAG OFF)
++set(CMAKE_THREAD_LIBS_INIT "")
++set(CMAKE_HAVE_THREADS_LIBRARY 1)
++set(CMAKE_USE_PTHREADS_INIT 1)
++set(Threads_FOUND TRUE)
+diff --git a/ps4/compat/include/ps4_fixups.h b/ps4/compat/include/ps4_fixups.h
+new file mode 100644
+index 0000000..0b8d225
+--- /dev/null
++++ b/ps4/compat/include/ps4_fixups.h
+@@ -0,0 +1,25 @@
++/* Force-included into every translation unit of the PS4 build (see cmake/ps4-toolchain.cmake).
++ *
++ * OpenOrbis v0.5.4 declares mode_t as `unsigned int` in <bits/alltypes.h>. The PS4 kernel (a
++ * FreeBSD 9 derivative) uses a 16-bit mode_t, and the C library's stat()/fstat()/lstat() hand
++ * the kernel's `struct stat` straight to the caller without converting it. With a 32-bit
++ * mode_t every member after st_mode sits 8 bytes too far: st_size reads st_blocks, the
++ * timestamps are garbage, and anything that trusts them breaks. That is why libzip could not
++ * open a single archive by path ("not a zip archive": it looked for the central directory at
++ * the wrong offset).
++ *
++ * <bits/alltypes.h> only defines a type when its __DEFINED_ guard is not set, so claiming
++ * mode_t here, before any system header, gives every header the kernel's layout.
++ *
++ * Passing a 16-bit mode_t to the prebuilt C library (mkdir, chmod, open...) is fine: the value
++ * travels zero-extended in a 32-bit register either way.
++ */
++#ifndef PS4_FIXUPS_H
++#define PS4_FIXUPS_H
++
++#if !defined(__ASSEMBLER__) && !defined(__DEFINED_mode_t)
++typedef unsigned short mode_t;
++#define __DEFINED_mode_t
++#endif
++
++#endif /* PS4_FIXUPS_H */
+diff --git a/ps4/compat/include/sys/endian.h b/ps4/compat/include/sys/endian.h
+new file mode 100644
+index 0000000..ca6250e
+--- /dev/null
++++ b/ps4/compat/include/sys/endian.h
+@@ -0,0 +1,3 @@
++/* PS4 compat: the compiler target is FreeBSD but the C library is musl. */
++#pragma once
++#include <endian.h>
+diff --git a/ps4/docs/TECHNICAL.md b/ps4/docs/TECHNICAL.md
+new file mode 100644
+index 0000000..d462c36
+--- /dev/null
++++ b/ps4/docs/TECHNICAL.md
+@@ -0,0 +1,72 @@
++# Technical notes
++
++## Overview
++
++| Area | Approach |
++| --- | --- |
++| Toolchain | Stock LLVM 18 + OpenOrbis v0.5.4 (musl libc, libc++), through `cmake/ps4-toolchain.cmake` |
++| Rendering | Piglet (OpenGL ES 2.0 + EGL 1.4). `port/fast3d/gfx_gles2.cpp` is a GLES2 variant of the port's GL backend |
++| Window | `port/fast3d/gfx_ps4.cpp`: fixed 1920×1080 Piglet surface, timer-paced frames, SDL for events only |
++| SDL2 | 2.30.9, dummy video driver; events, timing and the game controller API |
++| Controllers | `scePad` per logged-in user (up to 4), each exposed to SDL as a virtual DualShock 4 while connected; logins, logouts and power-offs are polled twice a second, and `input.c`'s own hotplug handling assigns players |
++| Audio | `sceAudioOut`; the game mixes at 22020 Hz, a feeder thread resamples to 48 kHz |
++| Memory | `mmap`/`munmap` replaced so the C heap lives in its own arena, leaving flexible memory to Piglet |
++| Files | Everything under `/data/perfectdark` with absolute paths (relative paths fail with `EINVAL`) |
++
++PS4 sources added by the patch:
++
++- `port/src/ps4/ps4main.c`: process entry, boot log, signal handler, 8 MiB game thread, `--basedir`/`--savedir`.
++- `port/src/ps4/ps4platform.c`: module loading, Piglet configuration list, EGL, vsync watchdog, pad.
++- `port/src/ps4/ps4heap.c`: heap arena (512 MiB system flexible memory, else 512→128 MiB direct memory).
++- `port/fast3d/gfx_gles2.cpp`, `gfx_ps4.cpp`: renderer and window backend.
++
++Hooks in existing files: `platform.h` (`PLATFORM_PS4`), `CMakeLists.txt` (target and source
++selection), `video.c` (backend choice, 1080p/60 fps defaults), `audio.c` (sceAudioOut branch),
++`input.c` (attach the pad), `system.c` (paths), `main.c` (`main` → `pdMain`), `gfx_pc.cpp` (always
++render offscreen).
++
++## Renderer: GLES2 differences
++
++The upstream backend needs GL 3.0 / GLES 3.0. `gfx_gles2.cpp` keeps its combiner shader generator
++and changes:
++
++- **GLSL ES 1.00.** `textureSize()` becomes `uTexSize0/1` uniforms, fed in `draw_triangles` from
++  sizes recorded at upload. The blur loop uses `mod`/`floor` instead of `&`/`>>`, `mix()` gets a
++  float selector, and `0.3f` becomes `0.3`. Fragment shaders use `highp` when the driver reports it.
++- **No `glBlitFramebuffer`.** Framebuffer copies and the final present draw a textured quad with a
++  small dedicated program. The fast3d core caches program, attributes, viewport, scissor and texture
++  bindings, so the blit restores all of them.
++- **Always offscreen.** SoH found that reading the window surface (`glCopyTexImage2D`) takes
++  seconds on Piglet. Perfect Dark copies the current frame for several effects (`bondview.c`,
++  `menugfx.c`), so on PS4 `gfx_pc.cpp` always renders into its game framebuffer (as it already did
++  for MSAA) and presents it at the end of the frame (`GFX_ALWAYS_OFFSCREEN`).
++- **Formats and features.** Unsized `GL_RGBA`/`GL_RGB` textures, no VAOs, no MSAA, no depth clamp
++  (the existing `z *= 0.3` fallback is used), and `GL_MIRRORED_REPEAT` instead of mirror-clamp.
++  Depth is 24-bit if `GL_OES_depth24` is advertised and renders, otherwise 16-bit (SoH: a 32-bit
++  depth renderbuffer gives an incomplete framebuffer). The N64 itself used 16-bit Z.
++- **Non-power-of-two textures.** Without `GL_OES_texture_npot`, NPOT textures (framebuffer copies)
++  are forced to clamp and no mipmaps, otherwise they would be incomplete and sample black.
++
++`tests/shadertest` compiles the real generator on the host with stubbed GL entry points, produces
++9000 programs over all filter modes and option bits, and validates every shader with glslang as
++GLSL ES 1.00 (18002/18002 pass). A control shader with the desktop constructs fails as expected.
++
++## Things verified off-console
++
++- The OpenOrbis libc's `__mmap`/`mmap64` and `__munmap` are `jmp`s to the exported `mmap`/`munmap`,
++  so musl's `malloc` really does use the arena; `mremap` returns `ENOSYS`, so realloc copies.
++- All Piglet, EGL, pad, audio and system-service imports resolve to OpenOrbis stub libraries.
++- A clean checkout runs `setup.sh` → `build-deps.sh` → `build.sh` → `package.sh` to a `.pkg`.
++
++## Known risks (need a console)
++
++- **Piglet memory configuration.** It is copied from the SoH configuration verified on a PS4 Pro,
++  with fallbacks. Base PS4 and other firmwares are unknown territory.
++- **Vertex attributes.** The most complex combiners use up to 12 attributes (position, 2 texcoords,
++  4 clamp values, fog, grayscale, 4 inputs). GLES2 only guarantees 8. GCN hardware should offer 16;
++  `pd.log` prints `GL_MAX_VERTEX_ATTRIBS`. If it is lower, the clamp floats can be packed into one vec4.
++- **Shader compile hitches.** Each new combiner costs 0.1–0.3 s on Piglet's runtime compiler, and
++  linked programs cannot be cached (SoH). SoH's fix, which is not ported yet, is to record the
++  combiner ids seen and precompile them behind the splash screen on the next start.
++- **Vsync and frame pacing.** The 60 fps timer pacing is what worked for SoH. `Uncap Tickrate` and
++  framerates above 60 have not been considered.
+diff --git a/ps4/env.sh b/ps4/env.sh
+new file mode 100755
+index 0000000..d6c8a64
+--- /dev/null
++++ b/ps4/env.sh
+@@ -0,0 +1,73 @@
++# Source this file before building:  source ps4/env.sh
++#
++# Layout (everything lives in the perfect_dark repository):
++#   perfect_dark/                       the game
++#   perfect_dark/ps4/                   these scripts
++#   perfect_dark/ps4/tools/OpenOrbis/PS4Toolchain   OpenOrbis v0.5.4 (setup.sh downloads it)
++#   perfect_dark/ps4/tools/llvm/bin     optional: LLVM 18 (otherwise clang from PATH or /usr/bin)
++#   perfect_dark/ps4/tools/cmake-*/bin, ps4/tools/ninja   optional portable CMake / Ninja
++#   perfect_dark/ps4/prefix, ps4/deps   zlib + SDL2 built by build-deps.sh
++#   perfect_dark/ps4/custom/sce_sys/    your own icon0.png / pic0.png / pic1.png (kept on updates)
++#   perfect_dark/build/ps4              build output (build.sh)
++#   perfect_dark/ps4/out                finished .pkg (package.sh)
++#
++# Works in a Linux/WSL shell and in Git Bash / MSYS2 on Windows.
++_PDPS4_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++export PDPS4_DIR="$_PDPS4_DIR"
++export PD_GAME_DIR="$(cd "$_PDPS4_DIR/.." && pwd)"
++export PS4_TOOLS_DIR="$_PDPS4_DIR/tools"
++export PS4_BUILD_ROOT="$PD_GAME_DIR/build"
++
++# Paths handed to native Windows programs (cmake.exe, clang.exe, ...) must be C:/style.
++_W() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
++
++_CMAKE_BIN="$(ls -d "$PS4_TOOLS_DIR"/cmake-*/bin 2>/dev/null | head -1)"
++[ -n "$_CMAKE_BIN" ] && export PATH="$_CMAKE_BIN:$PATH"
++[ -d "$PS4_TOOLS_DIR/ninja" ] && export PATH="$PS4_TOOLS_DIR/ninja:$PATH"
++[ -d "$PS4_TOOLS_DIR/llvm/bin" ] && export PATH="$PS4_TOOLS_DIR/llvm/bin:$PATH"
++
++export OO_PS4_TOOLCHAIN="${OO_PS4_TOOLCHAIN:-$(_W "$PS4_TOOLS_DIR/OpenOrbis/PS4Toolchain")}"
++export PS4_PREFIX="${PS4_PREFIX:-$(_W "$_PDPS4_DIR/prefix")}"
++if [ -z "$PS4_LLVM_BIN" ]; then
++    if [ -d "$PS4_TOOLS_DIR/llvm/bin" ]; then
++        export PS4_LLVM_BIN="$(_W "$PS4_TOOLS_DIR/llvm/bin")"
++    else
++        _CLANG="$(command -v clang || true)"
++        [ -n "$_CLANG" ] && export PS4_LLVM_BIN="$(_W "$(dirname "$(readlink -f "$_CLANG")")")"
++    fi
++fi
++
++case "$(uname -s)" in
++    MINGW*|MSYS*|CYGWIN*) export OO_HOST_BIN="$OO_PS4_TOOLCHAIN/bin/windows"; export OO_EXE=".exe" ;;
++    Darwin*)              export OO_HOST_BIN="$OO_PS4_TOOLCHAIN/bin/macos";   export OO_EXE="" ;;
++    *)                    export OO_HOST_BIN="$OO_PS4_TOOLCHAIN/bin/linux";   export OO_EXE="" ;;
++esac
++# PkgTool.Core targets .NET Core 3.0; let it run on whatever newer runtime is installed.
++export DOTNET_ROLL_FORWARD=LatestMajor
++# PkgTool.Core aborts without ICU unless told to use invariant globalization.
++export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
++
++# Local, untracked folders that git must leave alone (also when update.sh resets the checkout).
++# Written to .git/info/exclude, which no reset or patch touches.
++ps4_protect_local_dirs() {
++    local excl
++    excl="$(git -C "$PD_GAME_DIR" rev-parse --git-path info/exclude 2>/dev/null)" || return 0
++    case "$excl" in /*) ;; *) excl="$PD_GAME_DIR/$excl" ;; esac
++    mkdir -p "$(dirname "$excl")"
++    touch "$excl"
++    grep -q "^# perfect dark ps4 local folders" "$excl" && return 0
++    cat >> "$excl" <<'EXCL'
++# perfect dark ps4 local folders
++/ps4/tools/
++/ps4/prefix/
++/ps4/deps/
++/ps4/custom/
++/ps4/pkg/
++/ps4/out/
++/ps4/pd.oelf
++/ps4/tests/shadertest/out/
++/ps4/tests/shadertest/inc/
++/ps4/tests/shadertest/harness
++/ps4/tests/shadertest/glstubs.cpp
++EXCL
++}
+diff --git a/ps4/package.sh b/ps4/package.sh
+new file mode 100755
+index 0000000..8b901c9
+--- /dev/null
++++ b/ps4/package.sh
+@@ -0,0 +1,108 @@
++#!/usr/bin/env bash
++# Turns build/ps4/pd.x86_64.elf into an installable PS4 package (ps4/out/*.pkg).
++#
++#   ps4/package.sh [path/to/pd.x86_64.elf]
++#
++# Optional, for a self-contained personal install (never share such a package):
++#   BUNDLE_SPRX_DIR=<dir with libScePigletv2VSH.sprx + libSceShaccVSH.sprx>
++#
++# Images: ps4/custom/sce_sys/<name> if you put one there (kept when updating), otherwise the
++# default from ps4/pkg-static/sce_sys/:
++#   sce_sys/icon0.png   512x512    home screen icon (required)
++#   sce_sys/pic1.png    1920x1080  launch splash, shown by the system until the first game frame
++#   sce_sys/pic0.png    1920x1080  home screen background
++set -e
++HERE="$(cd "$(dirname "$0")" && pwd)"
++source "$HERE/env.sh"
++
++TITLE="${PKG_TITLE:-Perfect Dark}"
++VERSION="01.00"
++TITLE_ID="${PKG_TITLE_ID:-PDRK00001}"
++CONTENT_ID="IV0000-${TITLE_ID}_00-PERFECTDARKPORT0"
++# System auth info + program id of the OpenOrbis Piglet sample: required to load Piglet.
++AUTHINFO="000000000000000000000000001C004000FF000000000080000000000000000000000000000000000000008000400040000000000000008000000000000000080040FFFF000000F000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
++PAID="0x3800000000000035"
++
++OO="$OO_PS4_TOOLCHAIN"
++BIN="$OO_HOST_BIN"
++ELF="$(readlink -f "${1:-$PS4_BUILD_ROOT/ps4/pd.x86_64.elf}")"
++STAGE="$HERE/pkg"
++OUT="${OUT_DIR:-$HERE/out}"
++
++[ -f "$ELF" ] || { echo "missing $ELF, build first"; exit 1; }
++
++rm -rf "$STAGE"
++mkdir -p "$STAGE/sce_sys/about" "$STAGE/sce_module" "$OUT"
++# your own image if there is one, else the default; prints nothing if neither exists
++image() {
++    if [ -f "$HERE/custom/sce_sys/$1" ]; then echo "$HERE/custom/sce_sys/$1"
++    elif [ -f "$HERE/pkg-static/sce_sys/$1" ]; then echo "$HERE/pkg-static/sce_sys/$1"; fi
++}
++ICON0="$(image icon0.png)"
++cp "$ICON0" "$STAGE/sce_sys/icon0.png"
++cp "$OO/samples/piglet/sce_sys/about/right.sprx" "$STAGE/sce_sys/about/right.sprx"
++cp "$OO/samples/piglet/sce_module/libc.prx" "$OO/samples/piglet/sce_module/libSceFios2.prx" "$STAGE/sce_module/"
++
++EXTRA_FILES=""
++
++# Checks a PNG header: size and that it is RGB without alpha, which the system wants for its
++# images. Only warns: the package still builds.
++check_png() { # file width height
++    python3 - "$1" "$2" "$3" <<'PYEOF'
++import struct, sys
++path, want_w, want_h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
++data = open(path, 'rb').read(33)
++if data[:8] != b'\x89PNG\r\n\x1a\n':
++    print(f'WARNING: {path} is not a PNG file'); sys.exit()
++w, h = struct.unpack('>II', data[16:24])
++depth, ctype = data[24], data[25]
++if (w, h) != (want_w, want_h):
++    print(f'WARNING: {path} is {w}x{h}, the system expects {want_w}x{want_h}')
++if ctype != 2 or depth != 8:
++    print(f'WARNING: {path} should be a 24-bit RGB PNG without alpha (colour type {ctype}, depth {depth})')
++PYEOF
++}
++
++SYS_IMAGES=""
++for pic in pic0 pic1; do
++    PIC="$(image $pic.png)"
++    if [ -n "$PIC" ]; then
++        echo "== $pic.png: $PIC"
++        check_png "$PIC" 1920 1080
++        cp "$PIC" "$STAGE/sce_sys/$pic.png"
++        SYS_IMAGES="$SYS_IMAGES sce_sys/$pic.png"
++    fi
++done
++echo "== icon0.png: $ICON0"
++check_png "$ICON0" 512 512
++if [ -n "$BUNDLE_SPRX_DIR" ]; then
++    mkdir -p "$STAGE/assets/misc"
++    cp "$BUNDLE_SPRX_DIR/libScePigletv2VSH.sprx" "$BUNDLE_SPRX_DIR/libSceShaccVSH.sprx" "$STAGE/assets/misc/"
++    EXTRA_FILES=" assets/misc/libScePigletv2VSH.sprx assets/misc/libSceShaccVSH.sprx"
++fi
++
++cd "$STAGE"
++
++"$BIN/create-fself$OO_EXE" -in="$(_W "$ELF")" -out="$(_W "$STAGE/../pd.oelf")" \
++    --eboot "eboot.bin" --paid "$PAID" --authinfo "$AUTHINFO"
++
++SFO=sce_sys/param.sfo
++P="$BIN/PkgTool.Core$OO_EXE"
++"$P" sfo_new $SFO
++"$P" sfo_setentry $SFO APP_TYPE --type Integer --maxsize 4 --value 1
++"$P" sfo_setentry $SFO APP_VER --type Utf8 --maxsize 8 --value "$VERSION"
++"$P" sfo_setentry $SFO ATTRIBUTE --type Integer --maxsize 4 --value 0
++"$P" sfo_setentry $SFO CATEGORY --type Utf8 --maxsize 4 --value "gde"
++"$P" sfo_setentry $SFO FORMAT --type Utf8 --maxsize 4 --value "obs"
++"$P" sfo_setentry $SFO CONTENT_ID --type Utf8 --maxsize 48 --value "$CONTENT_ID"
++"$P" sfo_setentry $SFO DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
++"$P" sfo_setentry $SFO SYSTEM_VER --type Integer --maxsize 4 --value 1020
++"$P" sfo_setentry $SFO TITLE --type Utf8 --maxsize 128 --value "$TITLE"
++"$P" sfo_setentry $SFO TITLE_ID --type Utf8 --maxsize 12 --value "$TITLE_ID"
++"$P" sfo_setentry $SFO VERSION --type Utf8 --maxsize 8 --value "$VERSION"
++
++"$BIN/create-gp4$OO_EXE" -out pkg.gp4 --content-id="$CONTENT_ID" \
++    --files "eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/icon0.png$SYS_IMAGES sce_module/libc.prx sce_module/libSceFios2.prx$EXTRA_FILES"
++
++"$P" pkg_build pkg.gp4 "$(_W "$OUT")"
++ls -la "$OUT"
+diff --git a/ps4/pkg-static/sce_sys/icon0.png b/ps4/pkg-static/sce_sys/icon0.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..959ca7caef9aee070ed06c5846205f1f5ce8a8f5
+GIT binary patch
+literal 10605
+zcmdUVc|25Y|Np2&WT{9JlCmU}wTKbfLz^ujSxXGr4TdZ&)~v}gq^NA!*O{^J4B4^{
+z*$u`vGiI2X-_iYi@88q&-1qZ*e}Ddt^BT;#&bdC@^|?Nu_j$j*t*^<#beahS0<mao
+z-Mk9|9RU730Ak$#1wE~n4+4qGXy3eX-#c}6!pHCaTxQFLmr#ifhO6N?ft_%O<Iqi&
+z^OqikR$F}vCoJa=Ru7nA5&5fw7xRa{4t_;E$Y=IYlT*LJxO*<d|Hu)uwuV@Lj9qNk
+zIQVX(ik4PGt=oLp?ry-IwQA4xh3+d|jZh;s)w^FopwF%6Lqx7YZ%#6OfU*k0{WjZ$
+zG0a<$n;+;vlM#Sy>UTh(3=u$V4s|+E;0F;9=r#vE2=wLy2&8g{0|XLz^XH&Ac2&mU
+z*|Hb|WzuXM&V$tT7ejjS0!M)<fO%@dxqrL+->3L#=Q0}yJnYT9^ufOrBwj#3)DU|G
+z1d@4lTs1zuJGSD*=XC8~_sl}AlxqS35wEj{?dxRO=V$kuB9+`{04WWSAO1?rf0yMi
+z)opkb1C<v1Lmk9r_<z&qFP^dQgCT1W$e|AK0@&-}B-6Q{4Es6*1`H*w960b#_P0H*
+z+UB21w=cCa$s!qj^uPEdIfPvS9G9@KJ$!HN(c!;#+V85eg$V42fU(TKDC2xsb6=)H
+z2W9EM4gl`sv3JY(4uVt;3JKhttBTt+Vm}Fv`8BtnWS2b``#%TDpL5;<0_MhAcSPHM
+zK(rGZ{>4ZCDcJse#{QsqZAO8R@f7a2|6{q|LoYd`fcWT-YZ&w2Fa3LT{}xpDxn|qU
+zZfHdZ{2o-l$Ng`jaQvMKfz`19E&4-K9P97F`2V7))#Wxs^09wJ!MneUg0PT}_w!pp
+zpx!`j#ye*3gdy}dT#x)WC4dNH6d>AZ{5kG-XA5Owl}!G)=Eb#tDP9{(SEm%)8s)Pv
+zqy8ZJ=k=P2Ne4)ugQLS|5lKlgadB}`ad8O=iHkk$J<1+ZHMM!SuvQi?2E>;f23K6J
+z@<z?u)gX%coGV72MS9kBJD14*c<T5RIF_F}Iy&zEd9kBYtfK??xY*I5qpKs<(Rm?~
+zh3Nz6Y-sc2B9luuF#gHCg^)2@V4Oi(SI<>%7hJ)_t|#ux*SyVHMp-MF(~&J=?>)zy
+z%3rwAtJCivq-#|R9bcnyn6#vnvD=ubf*Y#593Yt!e8=8CAN&!Y+agg(<jd*z+1%O4
+z=aDZoFH;bkc{QZAWpOfBHq#Ol&NMjfGP^Ku$Jf(#-EVfiKA4+<O;%3ssjTWEBR#0_
+z(dAQzF9@;f+}dlW(B8sRDm(|5=ivSU^V?7ITR*XBWEDYZRR3Kf9FIr|VJ{C0qd<wD
+zU^UkFMyu}$mz44G)^affO?!~H^(u+>L`ln<Ws<Qa_m#(=hZ_6%b5XRN*CzrtcC6ur
+z52|eN9SnT_l?IqY`3&@sn{;)$+>|}%cM0VAl)_p{AzN%1TfgsB-$6)SAZ>?)PAoL1
+z5KzkR{I~RkPQ(SIYSPt>MOKl&vL*QuYC_Q(8k$d(PV(}&;SJHqodz!KFkp!Ex{QoY
+z6djX;C@8p#)<!fzqNPqpR*VxUpK?)1tD#%b&tP!QVZpT`VHkdnEX%w`dfogOpO1lU
+z*6i_1gBCTk9NM-Dk$YhD-sI!5r%EUNnWJBMub|*2NY6o*5_{kqht~%Jd&U)LQAFik
+zk&8kPutAF!5B;JSXyos?v>j-nGNO!+x%38|3M}lXo-c7m9pSrGG<P_zAZ2f<W6lkN
+z(!&O+9OMAGfALa<dnuE?VFIZS*qXQw9XfO!Ki&`XnHlW;c00fIK=cPthVhl6qC)Bn
+z?%3P6z!=S22rDuJ9H!v1em0-s06G(tVU6%5QagDHO)s6yXZR@y_`w^p(K>7nHpB+i
+zsfmCV#}==&qo@=}DPJg#@#xXLPHf?%AND$MyTMe@W#w2&Xw2lZwbhDzGsOIu_*ga3
+zQ|+bY#kR!-;x1U3=j6%q#R+1FegLf<$7csxr$><*`yWm$TSP09a?Nnn_po<VB$z<R
+z3{CXTE}yRo_Rh|GOB%I8+U{1rFGtL)1A)<%6b3JK4OfjAMefKJ%-+25nG*!7f2?=;
+zQ?gH+u!S^r>>Y=dID^DmD%s5VR6}Czs|jb=&a|+UlvEiX<2d?!$Y;sxf)IK-S4108
+z1(|<otwT-XamAQ$)T#arse&2#Q%CCs>IE`0f%8t^okq>bGs)MVHZ9)Cw6b#MAG^?v
+zm}^1NNNCwX*)*8$*s7$p?(+NQ$0Q7fLT0EKH!?I`BDf&-D4T<R&aA8zt_o>`hJ(PV
+zntDw28K%~d(dzOkA-!b31vVUVe)RR>;Bjf8y@Pu>XdUw+?=J&o?v1v&1B>?C6=btK
+zqg<5i<;$0a<m412gcO8?koM@NOtr%oSXr4^2|pahmiwfs$za+>5zVi6$^Gfoqm{h$
+zpsG~;g`vol3g_{0*i>LnI@E69oz0ir6bd4x_8Ul|vv1{d?*8FODqeLv10^gc_!)NW
+zXrE}+s}&NG8=5)DF|3bR(<DypQq6GQ0fR9wgX`8~fE7xcS>s3GM|rxtyEliV?8Xg?
+zTu=KccX$%Ik_(OV_9!Q4(z~NrTsm~O6({*sM3T6EDuDW<QBWg#b6rP(lOBY2l~J7Z
+zU5ykD*f6<wFYcq^smPX%I3XP-;&IJr8|qvYxcj}#YP%*M*tNk8?MK|&f^NcKjxw8>
+z(~3K=BL-vf<<w{tOv56e!_ayz6dIkKon2~(8HeJ~aPP&wxYj7B-6!qFm)(e99?e}=
+zCeUe<BJZWqLeyK1^yg*A>3bWN+zTw@2*GB~(3v^oRnHoRp`9s7e!`C@<}r~60_7|o
+z?9@)!#l0QRfv9@l42iHQ92_6tTT6k6zk}`;<z*EQbDrd*Zng3yB2IcArUyB3aB=!q
+zxrcsS4+%ID8;dX{yp97S-0H*1ur`GblW7&r&BPdBD2N`^?N{Yq^>Nn1pRA=rc#g;8
+z4X$r5zQolEdx!@F1b9)rg9Z%iq(wju^XoyupPDa7#X^Ne9)MICbNWfc3zmD^jWBKV
+z&RRw1e!{3sB|SYzoOc|iqH#%4#KMnYU@1;hwFtQFvQEU!x}TkpJ|bXanPGrr*u20}
+zEL~(=yu30aoZbCya<!sD`10j%TUpf(+AI|xp>bTw`0b3QdbKc?gwjb8_`!M~lwaXY
+zlvr0^Ge**~+x{>}oHJEPSWxclSrv^u<d0PXEnwR?zaq({rgDcbt2JAT>81T`Q14wm
+zJ+8I!5g%$0M<BZ@ut^{{bHJUQaOJp^b}SDd?TFLe0`uYr`BIPZ4$VJ5wSF=`<Kn-}
+zQtTC|a*+x2pqQ*n`dBWjRn>GW`V4EUF0*9}2j2-UMJb=sk1qT66Q_TvbuHl=(qbqI
+zqBM$-_J@$2wWp<`rW>sRqlqHz4Y-T&9(dsK*nV|>Z5=)(f)qL;SUwAs@#)6vVB4l4
+zT}8Zlj$C$roO^@e_w~$^;p!Sv*8>j(+8sUI$aoDJ!`#E!_G(a4v&0&oWZAAIm(r~k
+zcA;G>i~&%uYw?QcvA1`f$9#mqmKu2lP8O&ecQ@N+ZM56>1INx8>5=|%R+^M^;R1Ge
+z`rykB9Ua^A(YNNWz4cY6Q{mZAg7#FCG_<FEuKC2q;yahz*M5|nYdpu$QEZzU4gw0y
+zY+#h1$fekxUznRUGP>WUHB{5p$Sw64N{D@ak?T58BeSa#%KT;>Q(zYqq{}6uX;JiE
+zddbT9JXuQ-{xw8*SFQ9B>gLe*ky*i)QEevvw_RKu983%i4ZRL-Q;E8*K&?OZM7~SM
+ze-9QQE(yaFC~Y=)tUB0bXOVOulRnxTh~z_y$ALAv0j#>IKFjOGO=b<SDaxDmrJ(;V
+ztM;_7z2mn84z5nEDBPf~#w8o+CrY5tkL#v_43vmnulfW(71$b(*M6Q8g}Wj%*B{<^
+z7Jap%wMDxvgyG$<8WcAav)1fc8`0;GdewF_4ZK$m<eYKoY}S10V_ReS(9A~33H4n;
+zAmRm>n3*(~h?ag_92`GZ`EPT<P=2yNRX*PG=<*?YhR~3Zu#iv<4Rux?*~j;F059AD
+zQgu4FioZXF4EcV&L?Z3t#Y?frusHO=Q||5OL%y}N=$bQ-_}b((Z(91asb4y&OYRGH
+zj!v*AZ6@di2@KW6NFcBu_A~kEqlbM^>gGDmGCS?3)NbFuUjb7w|CP(**c*(_&q>@7
+z&nw!Pg`PzfJ;b+W$PdWZ5=XJ+--{&>xvPYvq6=yIIUg|}3aHe9goL(JVeNh62>#oW
+zzZ575oDx)~Eyit11dzqFzGpoLvc7GTs@(pTxBjpmY(WF(Yi1twtckaGd9LY@_5n1-
+zd{P<jZtj#nl+{ZYo|<!E>!?2Pbq3V(k||*|(dj|7D*yS_+$RnWF~^uk_BZHh3WKG$
+zZzeFFCD%}&ZUDH!9OxyL<8a+x@o{tGBW}^Oy<;`q0k&YIYSIg!CTu@-LoIlfDd3ly
+z-9Q)8oBKUBRui{-&7SK1I$~Fa(GFA%#Bfqiy0RO_9DL2=oEcE2+<I6Wf8cZeG-IvA
+z9Z)a)L~9hrYdG3qVPgs-5snp@dr{x;;sAHi{^IEIE3zRWye>^8!YA0z96xi6Q&f;N
+zzEmRhSb#@9IM{h$Xn?xmh0Y^AEgL%6mzyaV#&h&;lt{Xg8r^<C^13Lb<r?MfjfEG+
+zbLdtjM4k(aJR>1kUj6k=?z;P%1A!Ha-@Is@%$8T5Yjqs#PLT48kI&giwWUQnZ>XHY
+zpoc|YHWt}ZTADjiqh)e>-tDH_7FCJ*LMh$zxxx`iR|4+|8&q#xJX#@$ItZ*04?xej
+z^5qmxxVTbU66CcZMQ(Ua%5Kl_M*ZD_1B$h@m<W^od{j8)u3(VXHi>-FSv~0ZV@$Bo
+zqd!MmN4eJ0z<}k27!&9{P>5gm*c^Bp{F1ObS_30acD!NA*PJcMqYe%5*tctyk3DNG
+ziR$>3U}8Re`O@xOGO`-E-woL1UMdv%M-L$?E^(==yQjTf+0f|jSNvteE4%Y4s*Mdc
+z=k4um<YZ;{6O@beRd~A>?d+=O?(Ewc1&fyBJob_oSJqA|T(e_?!1!yq$9ciEy5Fmb
+zxJhU;_`L)*fMlm^eBhw6b4zOS!4nL+Oqfzn#7CQb#df5^2gy?~rE{XSz$$L3Z;Wl2
+zrsDujb)MYY*4#k&>M&ux*`)zvf&FhMZ#qk3Z@ZorpM(m)Kk%7e2Qh)x^?>>bjohnk
+zKaahIdQq~#x~6zm^i28<I*@YPGdb|?=9Uta7+dkiV3L;9zZ9Ru#+CsBSz2#PD^q?p
+z9ElTdH&fU1=zi1OIXl+~?1*(a@4DwPlqI%)`|g<P#5uUc^vPc3K(Qb?%rU-W)IE%a
+z4)STlK$(oJtUq~L^R6)+8tC|UUL9-Cnl!J~BIKahACv5L!<nl6N%FOf(jXNg-~zZ3
+zxp$8r<0PX)6E?S1pTk&EQ&!6Aq=CL%_gU(IM+`2=&n;w^pWt-)l!COJ`7?OWf@9@{
+zntBJB$;}yh;&{nf<w-R*eQ)e4@fnrwBn{+6PyT_6MsDh<zH0e-&PVKWYf~&PXfONC
+zrWjk*yMCXMq9xm1cV)|5@exBK7#8RNCby<22-|e5&)d9+E?e4O-Ly-kST8XEww-{M
+zIICg+Y)tES1f8q#iQH~>+P)3O(Dx}R`|FzrOv$_kSlaV&aHc)ZqTTvli$VHT=Z2m2
+zHb%X$4Pp|_GsFx<I>`j;P47cHl$nSdg*QKCIm#6AIx;dU^7ZS;*SHDC^_Y6V_w<K-
+zw)uCRoW?3``xJ4Giih`WNG<zv6Hl8}pzfY9_AZ!OvII9r^82w3(}5OWP1w=8vkdMV
+z8a-8FujHo(Wtam6A<Advbt41o6D4*nz|WO3IsH{G)8S@Akng@{V?qI#M`9I?-gDJE
+z4W}X_xIuxs-gr_{VnD6Qe$fvg0usIB<F)G*Xuq-*W}u%~0$_oK!Jz?V{7&4MywjlX
+z+4Ydb1DCZdm`S7amalsv^l)RXDHSNqx%3X7pY@jWb_)+H^|q0eb_f^H`ZEgL936IC
+zLr`8;ja+-cb|}3OFsBDlu}e~?4RTRCK%-UHF9K3|!ZYmby;Q~J-H`Mi`1cN}%12U(
+zxB!ud^!uLejnG~svmYiovn*NUNt7EbY#ClX_wb>~_8JcaMj~y_&(C*KYn2JKBtK&S
+zSqV+;>7?zz!;K`&ttv+L`!-EF5E4D@@)0stw9<dUY#8$Mt%U;sB_daTyv_5-?KjFd
+zF?}eq(O29n3iwhM5RZYdGFIllkX_0`Z;yVWbjDi}@E`)1=$>$KG+%p{LTa+>RBvC`
+zB~9sF9~U1EP=+wx!$X~3J(Qk4)Sh|MZL25VFcoO&+?@lgt+R&If~mJbfeTlGU8!+o
+z#lce{l{F`;>PuDMT7w<rb8caNets_S0~}wzeEC`+QutX!tnl+^;8Rjm0{F(0MW(q)
+zhLg(?Kcj-H<W7yA<^SRKNcH=Va+vd**UlFus$M*rD>&o;(e*@gLTKfq&Mfdz>MT?W
+zo>EWuSBPmxOicV&{3#IV^yMQ0<NohQL&aQZPyWC<XKU#GKZ7k@;^RBbg03jM_yg>N
+zbR}`IfY$B)gvbCG@;Se~%07H(fHeL)DEI$j%0dDmJ!qQ?zmRB@;=BI_I`4yT%?GW1
+z;cA@wr8?-16i}4yNR>1zxUU%cA7)#6+bb_3GqB7LY*we2m&J5--=I^K)BL4&+cK+{
+zpXR?j0$|v6DEdPT;LQfHRsRYAkQy8|PD)Da?7Zf2ex_+USpQ{KuuK*l(_|_im6HB+
+zgNRx*tG7y=`u5G@;9((y^mC~_dvUEq$b_FeCOx~Qr68&b7xS@(FW}*+9(1gw@5+su
+z?xDdmDthBbqxSU0?aEEMPU^atnE0Wn)&(g>=6BKwBf^?Q9AcJ-68vHwyzLN;q$m{W
+ztHE!)_CI{#K^}Ft{MqvNx=TjbRC;1%02x-{VqB4v^bF=T&vr`gXVgo+Cq9V1Rh0ee
+z*vzC~#W~9opom$Fidlc<Lj<p{%3DH4%c&nA0AQfV@7ILyr!{2;YkIC;PfEIHW;!xH
+zeum@pX-+P%OH-SGsI_W?V6{@%lPzcF@HfkZF}mBJ%8-uY@A9zSk65@#-q8BuyC6Xg
+zb0tbx-Be5>IQ6odzNyn-W~oPkZd96r64H{EI9wh^wuK;);}VvtRSZo{4NXVBbVcBG
+zm3e#z2T$1bypF<+3?36Y&#Ik#U7fMdq2k&Z)?Ap1@d=R2Np^*1=Mv7eYZO3i)YeLW
+zvpu?$N{Z)pyJc5`jkV4($B@anM4C@u4od80<J-5$t%-&7$#2_kHTjua!B@=k+yZvu
+z64SsbD3iY1#>1iTLv>yvAa^|{!@1&$Nq0Z5Lsze!FQxTb<zph3`vk9Fte*4maqTNQ
+zxGTZ4=yKIF+du9tvSiEp9f30TVCcDoygjkSBgvev?m`hWqdCx*yi0TS?rpmxZYgwL
+zh!^agG3Q}o<BokC>f<9dlz#cDYuBu(DkD&DJ?-1&g-6Uv^ld0<8dS?!t;h7f(kdBz
+zaL@Ek3_PhyjPfJMUq7cr`iNb)tyaemz@{yDZN{TVuB3>2$jTbpe!6C=Sxi`SO}p=5
+z;eCI5{mVUuZ61!}$BvyjZMVIpYqr<E#v*f0p%Z9}`mCNCt0E;f4+i(3<W4IF3|IYh
+z3vNO&pFJ;;?O~<+%mypfJ>MDPo~Zk3<Z<#=9MsH{x-wp!*=8jEp)sV-_8bqV(2DtW
+zmhFZcto%v@XvO5<COHd+^ihx$_UIX(%@wYcIKjsYoN@6|gj*Ip9iQOwNeS+$V84NP
+zU%tqPg;;$15VO7xoWP3EfA8Nv9Sj{Vq!t&HXCorQH4@;^r=t-(h3VdD(+zPMN9*aL
+zYj=hN>r{rpsZb1h^zgh5KW!F4!#ezsn86J^p3p#gl7LJg@+H3Fz%gD8r1EBP3L52k
+zRUyDwP1_Xf2+OMSm=0^$;t%b6d&PODPvQ)1Kyi&J`W5gZh?CRVtoUZ>Lxm}YBO>`6
+z=GCkjtAsDgu$%R_P34J+q}T1DtB4w7RTMo@`P<?ru8#0Gqn&W6CGrvJ1$UXl!B$O+
+zMF?L4X?rk9OlNE<mRZwdi|EX+Kv>qjWaN0Fr$_Jg=@bP#tQ8snZchp{S6O6*B`v9{
+zQAp_QpVA9nwoUl8en?wyYSt>>p|!8d!N*(mlZ8Uq^%uUX^SjS96cwCSTqQU4iK@Pm
+z9ufA+H%ozSdaIe6Yk4=-9TODpd4GcAv``2m6HCojrY6RR0OMIDlpmQ9(s!k7gIyQv
+z()D<lHlOo2mG`!NZt80v{@6ocJIbMYv#F^EHk*V~CT`nG+VDtwjK<7fQGHcA(@I#I
+z@bRSukw-_rwSA^GhK=!5yIkVU0QK@J?cyE%&CTyjlB>(VZmxV;NvANB`d!0O8HU73
+zE9+6KQDT$#Amt{`duv^A%2@d<{HkYYP+H&S63VMTtPJiyUR{X#@X;IHg4gu?ga)Q}
+zMeH&PG-O!|Vca{(pTZ@5q4%SAMCH4jDbKre_*W-NGx43p4KH{djrb?4W*DL=#x~C$
+z>h|C(CaTDm{O;GkCK}MXEiYk^WU*tsLKnqC*=^NBfm8LBnqoP#yd~pdc(bX>V)3hY
+zKd6lwr2)xaE1$7m^02ChenitJER63;rdrt~{H%t|nZu$G3YUs^hn@7&ppM?RBG^A<
+z7e8+-M%SeE8&<Uz4^{e+E4~)yo9>Zw^Jzc%q;22BZuhEp-g<X!484tmS$`@t!;+UU
+zU$cvUmY^tQ9&*yY4Ig{k+RDSt&kOpu5(X_jmKf+pKY)5=g9HS&)^?LOYGw+`WCyv@
+zmf&#-RaPU%r#D}7bDU1R?$aR-M$m%nY1@n8urykmq%g)^7bTz;+0sKL<GE#aFp97c
+zldUDxGdzB6=Z=CcCARrP+Lqtbi()`N>fao-k&8Y9s}Fii%g7j-*v6O1ni&^3KsY%s
+zG%r1Id|<&7(Gu^N<9_{oPGgZPDONv<e-Ts@*ehxme&M=;-PEhM#+G0~5t&jvT0STL
+zX$=l)KPrELe!*^B88wGlDcC!BaF>O96w-EE;HJ3;z8+GsYEo03SzbP4SYbi%aHmaL
+z?@Gd)f@(O@dL+AWi#9{SV-<SHjrqhPJinaZFu8OHa^a}XGs*&NK7E20Hv<0V)Y)X}
+z_TV|0g|~bu+?MxJDpV%7`oo8Q@S$D_07h`xSS=lI*GB4ZnsYISNBC|=R!Ht9nq&J}
+zSM*Re0iG?H71GjSA0v2`sqX{S!pZ|Us+o=+sS@%q>X^kM$y10K24aOg^@|%M^3`ij
+z)gQ~)e&yZD)#ZmMxl>2YN7J1uqOnO;tx=w-MnJkXx_^p$SdFo-1OgilHDe256nI`7
+z<(_)a(8B1!{ZpL4rDMZ2(Ibzm7TGJXW9U?c5wb0m24iuO(_wJL1rqlHVkHksgWNTp
+z3<t@d;JhOV5+78@%vz>hY}Q5+s_c{6pRJ9+RL}vG8S?oiytV^L24c&?xJRY1<?T(u
+zxtA12!?xGPU|n8{Fu6;+wb^&)MZKKd=gE0LOY9#o)qzDs&We1d){NW=>0D{W&weHV
+zhK7iOvf!3lH*eM~Brx51aNA`>CIjdM-F5C+XXPW2Uu*L&gA3<;Kv6&mj#{lD&hsjc
+z`sQ5~k&$tA*Xi)MXYETM6OSKmT&aP%lV@LdFr#0{CwI&D)RfFws*qZvd4C`WoxlbQ
+z1H+|ITcccsB-=c?pnUo%-|T1R-E;iDGu0Bq#By85^>G3A9RQ$7x@~Agp1(&E7p*P-
+z`V^C>w_EO<e%X!Sfk_$Ld>J6rFZ-ngN%DS+jlJib%yo=gJjCJYvxoRThE?8(gq)%i
+zT%0w02Z~Jc^9#Er3MGAB*Qq~bJ6<_oI%ty=KzE3v-c+UcRX=HUxe%zM#>ou98d07U
+zWcxEdMGxOjtW&O$=QrJ(d?lZ<*nZ*?i%OB66n2Qa&uaB8=tJ<f&u8xI!Q7zIQfOoK
+ztYe|05AT_i^VMt<4l?C@)c4P~YDMMI*jrQ9l87NPnX&*EYwJYBP6H*MrDw8AlI=4I
+zE_L~V!RkvVo{u=Xn-9;CEmVNFGrf18SOsBMua8;ie#+m{6jdm?rRL;>=p^OMH8(FL
+zEqRbqe^?;QEUvy!$?fb^v^eF$44}AD7T#eW5R)~|w*6jOcUzf5LNrUqn{P0>%E`Cl
+z&Fl?qE0Ak&nOp86GE&8J9A^b?S_ModVCLIqUg~D(t{ixg`13fqJiT~w;K!nGdBlVr
+zlv=-=b|*9J``0KnzMV#XHB?P|QzvRKl*cQhm9We^ESwqaSg&CrUF5Ns6J=8wAVzB{
+zn$ONoWIh|)Vu7$4iDhLKjehUq<fzYpzKyNT&fenuxv=0h7qqSoU_JT>hNC)ZFt0~i
+zTEa>27+<Qz6QJ%;Ah~cFR8w~=!aWO`j<7QGgRSj4vA|O!wjt)IvD?N;Rrbc6*uabo
+zN64N9G?y{_&1o;Sr=5;Djnlr5YR4Yp68lIr-rFqnATKF0>C>(BO}K$%svNF7Tw<sC
+zRr@pjG#GKJuRR}D48xvWn!#3wGzmyM!!d-Xw}2cs#^>Gk6NlNHo7Cf39vkm{-1>g7
+zTTf5CuvHJ<=UX{u=wk9?l}-7(@B7}MRkPfV&QXaW!#Q>Je5X-p@01u@h{0nn_Hp#%
+zvZxvXkMV78lCZ(74evGopEuQ?X#4AxHBNs!eCTEieo_AXli3jM%wr1>XmXhsy1kJ>
+z_RQ7=UT`IB{qyXVd)dtww)G6m+{m-8X8!&zCOa8#vkJ7+c+U`UnzDxR9FVF3#H0>$
+zkJGJPUvgebD0{=BcRs@}=o&RvCTfc=gNL0<0FYKFN@qWFVKZ@WVt=wYt%*)3MS7au
+zuyFRn1gO3O3IU)ZZXYiJ@?&jT3<!ABc`i5;ol)<vuz^Mcd9Kip#>*D*IhXM4A<kXl
+zgl5k6GWgNtC%!z9kk9!A4}k4!)qJ_kad-Y~*4+C6Q*ldHzO)sEC0D~cclVYY3oAE3
+zE$NY12zdhm&@Jj+Cc51UYkUf@UT)EL{+r9XYY({GzkULppM3Vpk21@nuvdH!(gk+i
+z>mRn@_8hFN&x)f+`bn)`FicEzHmy2mZCvf5FlK3;R34p)9V?lbOJiN&!ck|!#ukJv
+z6-lwosqM<7!I!uME=~{j;wR0;v2OM`<C_$qH1sr@>H3j?3|RVEy}ay9L04~^NqzTf
+zA+CZwmrHv>-JhFF#T1$X6qCxh{-v(=4&apW+qUvk#Q?!kgn(+|U$L<=myj741y<xz
+z@{t9l85uiWOL5#U4ea6Do6;v!Qr-g@s1MNgSHbP_SnKA;k;h;1zg}!ZcaN80fr2~j
+znoAncGW?+WtKDrmdgh8$xfeVm=62l3Lrb%JhDM2T2|yee*sm!Jvpfk0Un^GhZ>rqb
+zppai`s+;XmB2$kY;@W@Ls<t$TyFcjE^O=3KefSP_-F3!{kjf~a955&8(^|MV5{Int
+zZzF#4>)EI9B!|o@neeWR08OoA7s_FQ%vmr&EN3Gj<NuDn@sRQG!?S|^_8MgUd`&v<
+z1Haf7|IBterRzAGUw4f2)*pQ}*L(>x<A0`TX~WJQ{ev|!`7hj|`<<&99tf`RUk&{K
+zmMQe_95A5K2j1iUEeYpOrj4zZmd>Crz+Pf`7s8%htl%T&@aE|GU;RG7JR6}u^ta@)
+zDtYO1|1&Q6H()^Oh&itQk87x!{~cz~J@wC+!C!E*{-pJI|6#a)ql*1A=PBe<mk@-W
+zpe6PvF-PL;-!tX@eDv?cAE4o>KTCXj_;2_(e?lsMn(}Wbc^&&N%Kn~KbxU;^`t2V?
+zq<z>iL*$=nXzP-Y_=*={jMD#26Ibc0zo>8OTfh6_FHFhDsP^~tv6T8>)GV?0f43O^
+egWdzQgD=tbA<{dkUjZ5=NLyY1W`XLX7yk!SP}jWx
+
+literal 0
+HcmV?d00001
+
+diff --git a/ps4/pkg-static/sce_sys/pic1.png b/ps4/pkg-static/sce_sys/pic1.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14cc70c6c4f31127e60e0fcedfc3babb6e64311
+GIT binary patch
+literal 21232
+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
+UehY|y!eIN&t^Zc|mCL372K!PAZ~y=R
+
+literal 0
+HcmV?d00001
+
+diff --git a/ps4/setup.sh b/ps4/setup.sh
+new file mode 100755
+index 0000000..471e057
+--- /dev/null
++++ b/ps4/setup.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++# One-time setup, run from anywhere: downloads OpenOrbis v0.5.4 (LLVM 18 build) to ps4/tools/
++# and tells git to leave the PS4 folders alone. LLVM 18 (clang, clang++, ld.lld, llvm-ar) must be
++# installed, or placed in ps4/tools/llvm/bin.
++#
++# Next: ps4/build-deps.sh && ps4/build.sh && ps4/package.sh
++set -e
++HERE="$(cd "$(dirname "$0")" && pwd)"
++source "$HERE/env.sh"
++
++ps4_protect_local_dirs
++
++if [ ! -d "$PS4_TOOLS_DIR/OpenOrbis/PS4Toolchain" ]; then
++    echo "== downloading OpenOrbis v0.5.4"
++    mkdir -p "$PS4_TOOLS_DIR"
++    curl -fL -o "$PS4_TOOLS_DIR/oo.tar.gz" \
++        https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
++    tar xzf "$PS4_TOOLS_DIR/oo.tar.gz" -C "$PS4_TOOLS_DIR"
++    rm "$PS4_TOOLS_DIR/oo.tar.gz"
++fi
++
++command -v clang >/dev/null || [ -x "$PS4_TOOLS_DIR/llvm/bin/clang" ] || [ -x "$PS4_TOOLS_DIR/llvm/bin/clang.exe" ] \
++    || echo "WARNING: no clang found (LLVM 18 needed)"
++echo "setup done; next: ps4/build-deps.sh && ps4/build.sh && ps4/package.sh"
+diff --git a/ps4/tests/shadertest/gen_stubs.py b/ps4/tests/shadertest/gen_stubs.py
+new file mode 100755
+index 0000000..0e5818f
+--- /dev/null
++++ b/ps4/tests/shadertest/gen_stubs.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++# Generates no-op definitions for every GLES2 entry point declared in the toolchain's gl2.h /
++# gl2ext.h, so gfx_gles2.cpp can be compiled and driven on the host.
++import re, sys
++oo = sys.argv[1]
++out = ['#include <GLES2/gl2.h>', '#include <GLES2/gl2ext.h>', '#include "glcapture.h"', 'extern "C" {']
++seen = set()
++for hdr in ('GLES2/gl2.h', 'GLES2/gl2ext.h'):
++    src = open(f'{oo}/include/{hdr}').read()
++    for m in re.finditer(r'GL_APICALL[ \t]+([^\n#]+?)[ \t]*GL_APIENTRY[ \t]+(gl\w+)[ \t]*\(([^;#]*?)\);', src):
++        ret, name, args = m.group(1).strip(), m.group(2), ' '.join(m.group(3).split())
++        if name in seen or name in ('glShaderSource', 'glGetShaderiv', 'glGetProgramiv', 'glGetString',
++                                    'glCreateShader', 'glCreateProgram', 'glGetIntegerv', 'glGetShaderPrecisionFormat',
++                                    'glGetUniformLocation', 'glGetAttribLocation', 'glCheckFramebufferStatus', 'glIsEnabled'):
++            continue
++        seen.add(name)
++        body = '' if ret == 'void' else ' return 0;'
++        out.append(f'{ret} GL_APIENTRY {name}({args}) {{{body}}}')
++out.append('}')
++open('glstubs.cpp', 'w').write('\n'.join(out) + '\n')
+diff --git a/ps4/tests/shadertest/glcapture.h b/ps4/tests/shadertest/glcapture.h
+new file mode 100644
+index 0000000..a58e5e9
+--- /dev/null
++++ b/ps4/tests/shadertest/glcapture.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include <string>
++#include <vector>
++struct CapturedShader { unsigned type; std::string src; };
++extern std::vector<CapturedShader> g_captured;
+diff --git a/ps4/tests/shadertest/harness.cpp b/ps4/tests/shadertest/harness.cpp
+new file mode 100644
+index 0000000..c6576da
+--- /dev/null
++++ b/ps4/tests/shadertest/harness.cpp
+@@ -0,0 +1,80 @@
++// Host harness: runs the GLES2 backend's real shader generator for a large set of combiner ids
++// and options, writing every generated vertex/fragment shader to out/ for glslang validation.
++#define PLATFORM_PS4 1
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <random>
++#include <string>
++#include <vector>
++#include <set>
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
++#include "glcapture.h"
++
++std::vector<CapturedShader> g_captured;
++static unsigned g_next_shader = 1;
++static std::vector<unsigned> g_shader_types(1, 0);
++
++extern "C" {
++void sysLogPrintf(int level, const char *fmt, ...) { (void)level; (void)fmt; }
++void sysFatalError(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); fputc('\n', stderr); exit(2); }
++GLuint GL_APIENTRY glCreateShader(GLenum type) { g_shader_types.push_back(type); return g_next_shader++; }
++GLuint GL_APIENTRY glCreateProgram(void) { return 1000; }
++void GL_APIENTRY glShaderSource(GLuint sh, GLsizei count, const GLchar *const *str, const GLint *len) {
++    std::string s;
++    for (GLsizei i = 0; i < count; i++) s.append(str[i], (len && len[i] >= 0) ? (size_t)len[i] : strlen(str[i]));
++    g_captured.push_back({ g_shader_types[sh], s });
++}
++void GL_APIENTRY glGetShaderiv(GLuint, GLenum, GLint *p) { *p = 1; }
++void GL_APIENTRY glGetProgramiv(GLuint, GLenum, GLint *p) { *p = 1; }
++const GLubyte *GL_APIENTRY glGetString(GLenum) { return (const GLubyte *)""; }
++void GL_APIENTRY glGetIntegerv(GLenum, GLint *p) { *p = 16; }
++void GL_APIENTRY glGetShaderPrecisionFormat(GLenum, GLenum, GLint *r, GLint *p) { r[0] = r[1] = 127; *p = 23; }
++GLint GL_APIENTRY glGetUniformLocation(GLuint, const GLchar *) { return 1; }
++GLint GL_APIENTRY glGetAttribLocation(GLuint, const GLchar *) { return 1; }
++GLenum GL_APIENTRY glCheckFramebufferStatus(GLenum) { return GL_FRAMEBUFFER_COMPLETE; }
++GLboolean GL_APIENTRY glIsEnabled(GLenum) { return 0; }
++}
++
++extern "C" { bool gfx_framebuffers_enabled = true; }
++
++#include "../../../port/fast3d/gfx_gles2.cpp"
++
++int main(int argc, char **argv) {
++    const int count = argc > 1 ? atoi(argv[1]) : 3000;
++    std::mt19937_64 rng(1234);
++    gfx_gles2_api.init();
++    std::set<std::pair<uint64_t, uint32_t>> done;
++    int made = 0;
++    for (int filt = 0; filt < 3; ++filt) {
++        current_filter_mode = (FilteringMode)filt;
++        for (int i = 0; i < count; ++i) {
++            // only the items gfx_pc.cpp can encode and the generator knows: 0, INPUT_1..4,
++            // TEXEL0/0A/1/1A, 1, COMBINED, NOISE
++            static const uint8_t items[] = { 0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14 };
++            uint64_t id0 = 0;
++            for (int k = 0; k < 16; ++k) id0 |= (uint64_t)items[rng() % sizeof(items)] << (k * 4);
++            // half of the time: plausible single-cycle modes (second cycle mirrors the first)
++            if (i & 1) id0 = (id0 & 0xffffffffull) | ((id0 & 0xffffffffull) << 32);
++            uint32_t id1 = (uint32_t)rng() & 0x1fff;
++            if (!done.insert({ id0, id1 }).second) continue;
++            gfx_opengl_clear_shaders();
++            gfx_gles2_api.create_and_load_new_shader(id0, id1);
++            ++made;
++        }
++    }
++    // the blit program, too
++    system("mkdir -p out");
++    int n = 0;
++    for (auto &c : g_captured) {
++        char name[64];
++        snprintf(name, sizeof(name), "out/s%05d.%s", n++, c.type == GL_VERTEX_SHADER ? "vert" : "frag");
++        FILE *f = fopen(name, "w");
++        fwrite(c.src.data(), 1, c.src.size(), f);
++        fclose(f);
++    }
++    printf("%d programs, %zu shaders written\n", made, g_captured.size());
++    return 0;
++}
+diff --git a/ps4/tests/shadertest/run.sh b/ps4/tests/shadertest/run.sh
+new file mode 100755
+index 0000000..5c229aa
+--- /dev/null
++++ b/ps4/tests/shadertest/run.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++# Validates every shader the GLES2 backend can generate (sampled) as GLSL ES 1.00 with glslang.
++set -e
++HERE="$(cd "$(dirname "$0")" && pwd)"
++source "$HERE/../../env.sh"
++PD="$PD_GAME_DIR"
++cd "$HERE"
++mkdir -p inc/orbis
++cp -r "$OO_PS4_TOOLCHAIN/include/GLES2" "$OO_PS4_TOOLCHAIN/include/KHR" inc/
++printf '#pragma once\n#include <stdbool.h>\n#include <GLES2/gl2.h>\n#include <GLES2/gl2ext.h>\n' > inc/orbis/Pigletv2VSH.h
++python3 gen_stubs.py "$OO_PS4_TOOLCHAIN"
++rm -rf out
++clang++ -std=c++20 -O1 -w -D_LANGUAGE_C=1 -DGL_GLEXT_PROTOTYPES -Iinc -I"$PD/include" -I"$PD/include/PR" \
++    -I"$PD/src/include" -I"$PD/port/include" -I"$PD/port/fast3d" -include stdint.h \
++    harness.cpp glstubs.cpp "$PD/port/fast3d/gfx_cc.cpp" -o harness
++./harness "${1:-3000}"
++fail=0
++for f in out/*; do
++    if ! glslangValidator "$f" > "$f.log" 2>&1; then
++        fail=$((fail + 1))
++        [ $fail -le 3 ] && { echo "== $f"; cat "$f.log"; }
++    fi
++done
++total=$(ls out/*.vert out/*.frag | wc -l)
++echo "glslang (GLSL ES 1.00): $((total - fail)) / $total shaders valid"
++[ $fail -eq 0 ]
+diff --git a/ps4/update.sh b/ps4/update.sh
+new file mode 100755
+index 0000000..1d9be52
+--- /dev/null
++++ b/ps4/update.sh
+@@ -0,0 +1,61 @@
++#!/usr/bin/env bash
++# Updates this checkout to a new version of the PS4 patch:
++#
++#   ps4/update.sh path/to/perfect_dark-ps4.patch
++#
++# Puts the game code back to the upstream commit the patch is made against, then applies the
++# patch. Kept: ps4/tools, ps4/prefix, ps4/deps, ps4/custom (your images), ps4/out, build/.
++# Lost: any changes of your own to the game code or to the ps4/ scripts.
++set -e
++
++# The reset below replaces this very file; run from a copy so bash never reads a changed script.
++if [ -z "$PD_PS4_UPDATE_COPY" ]; then
++    tmp="$(mktemp /tmp/pd-ps4-update.XXXXXX)"
++    cp "$0" "$tmp"
++    PD_PS4_UPDATE_COPY="$tmp" PD_PS4_DIR="$(cd "$(dirname "$0")" && pwd)" exec bash "$tmp" "$@"
++fi
++trap 'rm -f "$PD_PS4_UPDATE_COPY"' EXIT
++
++PD_COMMIT=32a1cb9f268dd3ac73016801025c6bbbfa20130f   # upstream commit the patch is made against
++HERE="$PD_PS4_DIR"
++GAME="$(cd "$HERE/.." && pwd)"
++
++if [ -z "$1" ] || [ ! -f "$1" ]; then
++    echo "usage: ps4/update.sh path/to/perfect_dark-ps4.patch"
++    exit 1
++fi
++
++# read the patch before anything else: it may be sitting inside this checkout
++PATCH="$(mktemp /tmp/pd-ps4-patch.XXXXXX)"
++trap 'rm -f "$PD_PS4_UPDATE_COPY" "$PATCH"' EXIT
++tr -d '\r' < "$1" > "$PATCH"   # in case it was saved through Windows
++if ! grep -q '^diff --git a/ps4/update.sh' "$PATCH"; then
++    echo "ERROR: $1 does not look like a perfect_dark-ps4.patch (no ps4/ folder in it)"
++    exit 1
++fi
++
++source "$HERE/env.sh"
++ps4_protect_local_dirs
++
++cd "$GAME"
++git rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: $GAME is not a git checkout"; exit 1; }
++if ! git cat-file -e "$PD_COMMIT^{commit}" 2>/dev/null; then
++    echo "== fetching upstream commit ${PD_COMMIT:0:9}"
++    git fetch -q origin "$PD_COMMIT" || git fetch -q --unshallow origin || true
++    git cat-file -e "$PD_COMMIT^{commit}" || { echo "ERROR: commit $PD_COMMIT not available"; exit 1; }
++fi
++
++echo "== resetting the game code to upstream ${PD_COMMIT:0:9}"
++git config core.autocrlf false
++git rm -rq --cached .
++git reset -q --hard "$PD_COMMIT"
++git clean -fdq
++
++echo "== applying the patch"
++if ! git apply "$PATCH"; then
++    echo "ERROR: the patch did not apply; the folder is now plain upstream code"
++    exit 1
++fi
++chmod +x ps4/*.sh ps4/tests/shadertest/*.sh 2>/dev/null || true
++
++echo "== done; next: ps4/build.sh && ps4/package.sh"
+diff --git a/ps4/zlib-cmake/CMakeLists.txt b/ps4/zlib-cmake/CMakeLists.txt
+new file mode 100644
+index 0000000..9157c2e
+--- /dev/null
++++ b/ps4/zlib-cmake/CMakeLists.txt
+@@ -0,0 +1,11 @@
++cmake_minimum_required(VERSION 3.16)
++project(zlib C)
++# Minimal static-only build of zlib (upstream CMake insists on a shared library).
++set(Z ${ZLIB_SRC})
++add_library(z STATIC
++    ${Z}/adler32.c ${Z}/compress.c ${Z}/crc32.c ${Z}/deflate.c ${Z}/gzclose.c ${Z}/gzlib.c ${Z}/gzread.c
++    ${Z}/gzwrite.c ${Z}/inflate.c ${Z}/infback.c ${Z}/inftrees.c ${Z}/inffast.c ${Z}/trees.c ${Z}/uncompr.c ${Z}/zutil.c)
++target_compile_definitions(z PRIVATE HAVE_UNISTD_H=1 _LARGEFILE64_SOURCE=1 HAVE_STDARG_H=1)
++target_include_directories(z PUBLIC ${Z})
++install(TARGETS z ARCHIVE DESTINATION lib)
++install(FILES ${Z}/zlib.h ${Z}/zconf.h DESTINATION include)
+diff --git a/src/include/platform.h b/src/include/platform.h
+index 79a1864..12889e8 100644
+--- a/src/include/platform.h
++++ b/src/include/platform.h
+@@ -4,6 +4,10 @@
+ // detect OS
+ #if defined(_WIN32)
+ 	#define PLATFORM_WIN32 1
++#elif defined(__PS4__) || defined(__ORBIS__)
++	// PS4 homebrew (OpenOrbis toolchain): FreeBSD-derived kernel, musl-based libc
++	#define PLATFORM_POSIX 1
++	#define PLATFORM_PS4 1
+ #elif defined(__SWITCH__)
+ 	#define PLATFORM_POSIX 1
+ 	#define PLATFORM_NSWITCH 1

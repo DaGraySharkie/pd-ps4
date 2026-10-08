@@ -67,6 +67,9 @@ elseif(APPLE)
 elseif(NINTENDO_SWITCH)
   # Switch
   set(TARGET_OS "nswitch")
+elseif(PS4)
+  # PS4 homebrew, OpenOrbis toolchain (see the perfectdark-ps4 build scripts)
+  set(TARGET_OS "ps4")
 elseif(UNIX)
   # Generic *nix; assume Linux
   set(TARGET_OS "linux")
@@ -198,7 +201,9 @@ add_compile_options($<$<COMPILE_LANGUAGE:C>:-Wno-pointer-sign>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-function>)
 
 # Platform-specific flags
-if (APPLE)
+if (PS4)
+  # clang does not know this GCC warning
+elseif (APPLE)
   # Make it look for libs in the executable folder manually since CMake's rpath system is wack
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rpath @executable_path")
 else()
@@ -211,7 +216,13 @@ endif()
 set(LIBS )
 
 # SDL2
+if(PS4)
+  # static SDL2 cross-built by build-deps.sh (dummy video driver, virtual joystick)
+  set(SDL2_INCLUDE_DIR "${PS4_PREFIX}/include/SDL2")
+  set(SDL2_LIBRARY "${PS4_PREFIX}/lib/libSDL2.a")
+else()
 find_package(SDL2 REQUIRED)
+endif()
 if(NINTENDO_SWITCH)
   if(NOT SDL2_LIBRARY OR NOT SDL2_INCLUDE_DIR)
     # sometimes FindSDL2 just wants us to suffer and does not set these
@@ -230,7 +241,12 @@ endif()
 list(APPEND LIBS "${ZLIB_LIBRARY}")
 
 # GL
-if(NOT GL_LIBRARY)
+if(PS4)
+  # Piglet (GLES2 + EGL) comes in through the SCE stub libraries of the toolchain file;
+  # the C/C++ runtime as well
+  set(GL_LIBRARY "")
+  set(EXTRA_LIBRARIES "")
+elseif(NOT GL_LIBRARY)
   if(WIN32)
     set(GL_LIBRARY opengl32)
   elseif(NINTENDO_SWITCH)
@@ -241,10 +257,14 @@ if(NOT GL_LIBRARY)
     set(GL_LIBRARY GL)
   endif()
 endif()
-list(APPEND LIBS "${GL_LIBRARY}")
+if(GL_LIBRARY)
+  list(APPEND LIBS "${GL_LIBRARY}")
+endif()
 
 # Platform-specific extra libs
-if(NOT EXTRA_LIBRARIES)
+if(PS4)
+  # nothing
+elseif(NOT EXTRA_LIBRARIES)
   if(WIN32)
     set(EXTRA_LIBRARIES dbghelp -static-libstdc++)
   elseif(NINTENDO_SWITCH)
@@ -253,12 +273,23 @@ if(NOT EXTRA_LIBRARIES)
     set(EXTRA_LIBRARIES stdc++ m dl)
   endif()
 endif()
-list(APPEND LIBS "${EXTRA_LIBRARIES}")
+if(EXTRA_LIBRARIES)
+  list(APPEND LIBS "${EXTRA_LIBRARIES}")
+endif()
 
 # Sources
 
 file(GLOB_RECURSE SRC_PORT "${CMAKE_SOURCE_DIR}/port/*.c")
 file(GLOB_RECURSE SRC_PORT_CXX "${CMAKE_SOURCE_DIR}/port/*.cpp")
+
+# window/renderer backends: SDL2 + desktop GL/GLES3 everywhere, Piglet + GLES2 on PS4
+if(PS4)
+  list(FILTER SRC_PORT EXCLUDE REGEX "port/fast3d/glad/")
+  list(FILTER SRC_PORT_CXX EXCLUDE REGEX "port/fast3d/gfx_(opengl|sdl2)\\.cpp$")
+else()
+  list(FILTER SRC_PORT EXCLUDE REGEX "port/src/ps4/")
+  list(FILTER SRC_PORT_CXX EXCLUDE REGEX "port/fast3d/gfx_(gles2|ps4)\\.cpp$")
+endif()
 
 file(GLOB_RECURSE SRC_GAME "${CMAKE_SOURCE_DIR}/src/game/*.c")
 

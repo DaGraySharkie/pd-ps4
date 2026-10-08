@@ -1,3 +1,13 @@
+# The generators are Python scripts started through their shebang line, which only works where
+# commands run through a POSIX shell. Run them through the interpreter explicitly so Ninja on
+# Windows (commands go through cmd.exe) works too.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  set(PD_ASSET_PYTHON "${Python3_EXECUTABLE}")
+else()
+  set(PD_ASSET_PYTHON "")
+endif()
+
 # execute a header generator (execcmd) for every json file in jsonpath, collect headers in headerlist
 # note that this reads ROMID
 macro(generate_asset_headers jsonpath execcmd extraarg headerlist)
@@ -18,7 +28,7 @@ macro(generate_asset_headers jsonpath execcmd extraarg headerlist)
     add_custom_command(
       OUTPUT  ${HEADERNAME}
       DEPENDS ${JSON}
-      COMMAND ${execcmd} ${JSON} ${extraarg} --headers-only --romid=${ROMID}
+      COMMAND ${PD_ASSET_PYTHON} ${execcmd} ${JSON} ${extraarg} --headers-only --romid=${ROMID}
     )
     list(APPEND ${headerlist} "${HEADERNAME}")
   endforeach()

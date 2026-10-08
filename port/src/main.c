@@ -4,6 +4,7 @@
 #include <PR/ultrasched.h>
 #include <PR/os_message.h>
 
+#include "platform.h"
 #include "lib/main.h"
 #include "bss.h"
 #include "data.h"
@@ -93,7 +94,12 @@ static void cleanup(void)
 	// TODO: actually shut down all subsystems
 }
 
+#ifdef PLATFORM_PS4
+// the process entry point is in port/src/ps4/ps4main.c
+int pdMain(int argc, const char **argv)
+#else
 int main(int argc, const char **argv)
+#endif
 {
 	sysInitArgs(argc, argv);
 

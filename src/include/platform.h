@@ -4,6 +4,10 @@
 // detect OS
 #if defined(_WIN32)
 	#define PLATFORM_WIN32 1
+#elif defined(__PS4__) || defined(__ORBIS__)
+	// PS4 homebrew (OpenOrbis toolchain): FreeBSD-derived kernel, musl-based libc
+	#define PLATFORM_POSIX 1
+	#define PLATFORM_PS4 1
 #elif defined(__SWITCH__)
 	#define PLATFORM_POSIX 1
 	#define PLATFORM_NSWITCH 1

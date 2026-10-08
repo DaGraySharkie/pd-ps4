@@ -12,6 +12,9 @@
 #include <SDL.h>
 #include <PR/ultratypes.h>
 #include "platform.h"
+#ifdef PLATFORM_PS4
+#include "ps4platform.h"
+#endif
 #include "system.h"
 
 #ifdef PLATFORM_WIN32
@@ -216,6 +219,11 @@ void sysFatalError(const char *fmt, ...)
 
 void sysGetExecutablePath(char *outPath, const u32 outLen)
 {
+#ifdef PLATFORM_PS4
+	// the package is mounted read-only here
+	snprintf(outPath, outLen, "/app0");
+	return;
+#endif
 	// try asking SDL
 	char *sdlPath = SDL_GetBasePath();
 
@@ -250,6 +258,10 @@ void sysGetExecutablePath(char *outPath, const u32 outLen)
 
 void sysGetHomePath(char *outPath, const u32 outLen)
 {
+#ifdef PLATFORM_PS4
+	snprintf(outPath, outLen, PS4_DATA_DIR);
+	return;
+#endif
 	// try asking SDL
 	char *sdlPath = SDL_GetPrefPath("", "perfectdark");
 

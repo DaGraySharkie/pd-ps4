@@ -10,10 +10,20 @@
 #include "video.h"
 
 #include "../fast3d/gfx_api.h"
+#ifdef PLATFORM_PS4
+#include "../fast3d/gfx_ps4.h"
+#include "../fast3d/gfx_gles2.h"
+#else
 #include "../fast3d/gfx_sdl.h"
 #include "../fast3d/gfx_opengl.h"
+#endif
 
-#ifdef PLATFORM_NSWITCH
+#ifdef PLATFORM_PS4
+#define DEFAULT_VID_WIDTH 1920
+#define DEFAULT_VID_HEIGHT 1080
+#define DEFAULT_VID_FULLSCREEN true
+#define DEFAULT_VID_FULLSCREEN_EXCLUSIVE true
+#elif defined(PLATFORM_NSWITCH)
 #define DEFAULT_VID_WIDTH 1280
 #define DEFAULT_VID_HEIGHT 720
 #define DEFAULT_VID_FULLSCREEN true
@@ -38,9 +48,17 @@ static s32 vidFullscreenExclusive = DEFAULT_VID_FULLSCREEN_EXCLUSIVE;
 static s32 vidMaximize = false;
 static s32 vidCenter = false;
 static s32 vidAllowHiDpi = false;
+#ifdef PLATFORM_PS4
+// vsync can only be chosen when the EGL surface is created (ps4_vsync marker file), so frames
+// are paced by the window backend's timer instead
+static s32 vidVsync = 0;
+static s32 vidMSAA = 1;
+static s32 vidFramerateLimit = 60;
+#else
 static s32 vidVsync = 1;
 static s32 vidMSAA = 1;
 static s32 vidFramerateLimit = 0;
+#endif
 
 static s32 vidDisplayFPS = 0;
 static f32 vidDisplayFPSInterval = 1.f;
@@ -71,8 +89,15 @@ void optionsMenuInit();
 
 s32 videoInit(void)
 {
+#ifdef PLATFORM_PS4
+	wmAPI = &gfx_ps4;
+	renderingAPI = &gfx_gles2_api;
+	vidMSAA = 1; // GLES2 has no multisampled render targets
+	vidFramebuffers = true; // the game always renders offscreen here
+#else
 	wmAPI = &gfx_sdl;
 	renderingAPI = &gfx_opengl_api;
+#endif
 
 	gfx_current_native_viewport.width = 320;
 	gfx_current_native_viewport.height = 220;

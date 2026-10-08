@@ -5,6 +5,9 @@
 #include <PR/os_thread.h>
 #include <PR/os_cont.h>
 #include "platform.h"
+#ifdef PLATFORM_PS4
+#include "ps4platform.h"
+#endif
 #include "input.h"
 #include "video.h"
 #include "config.h"
@@ -723,6 +726,11 @@ s32 inputInit(void)
 	if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC)) {
 		SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC);
 	}
+
+#ifdef PLATFORM_PS4
+	// the DualShock 4 is read with scePad and shows up here as an SDL virtual game controller
+	ps4PadAttach();
+#endif
 
 	// try to load controller db from an external file in the save folder
 	if (fsFileSize("$S/" CONTROLLERDB_FNAME)) {

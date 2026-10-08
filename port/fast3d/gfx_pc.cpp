@@ -25,6 +25,15 @@
 
 #include "platform.h"
 
+// Render the game into an offscreen framebuffer even without MSAA or scaling, and present it at
+// the end of the frame. Needed where the window surface can't be read back efficiently (PS4:
+// copying from it takes seconds), since several effects copy the current frame.
+#ifdef PLATFORM_PS4
+#define GFX_ALWAYS_OFFSCREEN 1
+#else
+#define GFX_ALWAYS_OFFSCREEN 0
+#endif
+
 #include "gfx_pc.h"
 #include "gfx_cc.h"
 #include "gfx_window_manager_api.h"
@@ -1684,7 +1693,7 @@ static void gfx_adjust_viewport_or_scissor(XYWidthHeight* area, bool preserve_as
     }
 
     if (!game_renders_to_framebuffer ||
-        (gfx_msaa_level > 1 && gfx_current_dimensions.width == gfx_current_game_window_viewport.width &&
+        ((gfx_msaa_level > 1 || GFX_ALWAYS_OFFSCREEN) && gfx_current_dimensions.width == gfx_current_game_window_viewport.width &&
             gfx_current_dimensions.height == gfx_current_game_window_viewport.height)) {
         area->x += gfx_current_game_window_viewport.x;
         area->y += gfx_current_window_dimensions.height -
@@ -2631,7 +2640,7 @@ extern "C" void gfx_start_frame(void) {
 
     bool different_size = gfx_current_dimensions.width != gfx_current_game_window_viewport.width ||
                           gfx_current_dimensions.height != gfx_current_game_window_viewport.height;
-    if (gfx_framebuffers_enabled && (different_size || gfx_msaa_level > 1)) {
+    if (gfx_framebuffers_enabled && (different_size || gfx_msaa_level > 1 || GFX_ALWAYS_OFFSCREEN)) {
         game_renders_to_framebuffer = true;
         if (different_size) {
             gfx_rapi->update_framebuffer_parameters(game_framebuffer, gfx_current_dimensions.width,
@@ -2690,7 +2699,7 @@ extern "C" void gfx_run(Gfx* commands) {
         gfx_rapi->start_draw_to_framebuffer(0, 1);
         gfx_rapi->clear_framebuffer(true, true);
 
-        if (gfx_msaa_level > 1) {
+        if (gfx_msaa_level > 1 || GFX_ALWAYS_OFFSCREEN) {
             bool different_size = gfx_current_dimensions.width != gfx_current_game_window_viewport.width ||
                                   gfx_current_dimensions.height != gfx_current_game_window_viewport.height;
 
@@ -2787,7 +2796,12 @@ extern "C" void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top, 
             // flip Y
             top = gfx_current_dimensions.height - top - 1;
         }
-        if (use_back && gfx_msaa_level > 1) {
+        if (GFX_ALWAYS_OFFSCREEN && game_renders_to_framebuffer) {
+            // Both the back buffer (current frame, use_back) and the front buffer (the frame last
+            // presented, e.g. videoCopyFramebuffer() between frames) are the game framebuffer's
+            // contents: it is only cleared when the next frame starts. Never read the window.
+            fb_src = game_framebuffer;
+        } else if (use_back && gfx_msaa_level > 1) {
             // read from the framebuffer we've been rendering to
             fb_src = game_framebuffer;
         }
