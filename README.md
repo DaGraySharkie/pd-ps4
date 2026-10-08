@@ -74,14 +74,7 @@ For the PAL or Japanese version: `ROMID=pal-final ps4/build.sh` or `ROMID=jpn-fi
 ps4/package.sh
 ```
 
-## 7. Install on the PS4
-
-1. Over FTP, copy `libScePigletv2VSH.sprx` and `libSceShaccVSH.sprx` (dumped from your console) to
-   `/data/self/system/common/lib/`.
-2. Copy your ROM to `/data/perfectdark/pd.ntsc-final.z64` (US v1.1 ROM, `.z64` format).
-3. Install the `.pkg` with GoldHEN's Package Installer.
-
-## Updating
+## 7. Updating
 
 ```bash
 cd ~/pd-ps4
